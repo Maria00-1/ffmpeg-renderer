@@ -1,0 +1,14 @@
+{
+  "name": "ffmpeg-renderer",
+  "version": "1.0.0",
+  "description": "FFmpeg video renderer API for Dark LATAM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "uuid": "^9.0.0"
+  }
+}
