@@ -18,6 +18,10 @@ const OUTPUT_DIR = '/app/outputs';
 
 // ─── Helper: descargar archivo siguiendo todos los redirects ──────────────────
 function downloadFile(url, dest) {
+  // Google Drive: add confirm=t to bypass virus-scan confirmation page
+  if ((url.includes('drive.google.com') || url.includes('drive.usercontent.google.com')) && !url.includes('confirm=')) {
+    url += '&confirm=t';
+  }
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
 
