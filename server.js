@@ -118,11 +118,11 @@ app.post('/render', async (req, res) => {
     // 2. Concatenar audios
     const mergedAudio = path.join(jobDir, 'audio_merged.mp3');
     if (audioPaths.length === 1) {
-      fs.copyFileSync(audioPaths[0], mergedAudio);
+      await runFFmpeg('-i "' + audioPaths[0] + '" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mergedAudio + '"');
     } else {
       const listFile = path.join(jobDir, 'audio_list.txt');
       fs.writeFileSync(listFile, audioPaths.map(p => "file '" + p + "'").join('\n'));
-      await runFFmpeg('-f concat -safe 0 -i "' + listFile + '" -c copy "' + mergedAudio + '"');
+      await runFFmpeg('-analyzeduration 100000000 -probesize 50000000 -f concat -safe 0 -i "' + listFile + '" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mergedAudio + '"');
     }
 
     // 3. Duración total del audio
