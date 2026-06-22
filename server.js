@@ -12,50 +12,59 @@ app.use(express.json({ limit: '10mb' }));
 const WORK_DIR = '/tmp/renders';
 const OUTPUT_DIR = '/app/outputs';
 
-// Crear directorios si no existen
 [WORK_DIR, OUTPUT_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
-// ─── Helper: descargar archivo con redirect ───────────────────────────────────
+// ─── Helper: descargar archivo siguiendo todos los redirects ──────────────────
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    const protocol = url.startsWith('https') ? https : http;
 
-    function get(currentUrl, redirectCount = 0) {
-      if (redirectCount > 5) return reject(new Error('Too many redirects'));
-      protocol.get(currentUrl, (res) => {
+    function get(currentUrl, redirectCount) {
+      if (redirectCount === undefined) redirectCount = 0;
+      if (redirectCount > 10) return reject(new Error('Too many redirects'));
+
+      const protocol = currentUrl.startsWith('https') ? https : http;
+      const options = {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; FFmpegRenderer/1.0)',
+          'Accept': '*/*'
+        }
+      };
+
+      protocol.get(currentUrl, options, function(res) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          file.destroy();
-          const redirectUrl = res.headers.location;
-          const newProtocol = redirectUrl.startsWith('https') ? https : http;
-          newProtocol.get(redirectUrl, (res2) => {
-            if (res2.statusCode !== 200) {
-              reject(new Error(`Download failed: ${res2.statusCode} for ${redirectUrl}`));
-              return;
-            }
-            res2.pipe(file);
-            file.on('finish', () => { file.close(); resolve(dest); });
-            file.on('error', reject);
-          }).on('error', reject);
+          res.resume(); // descartar body del redirect
+          var redirectUrl = res.headers.location;
+          // manejar redirects relativos
+          if (redirectUrl.startsWith('/')) {
+            var parsed = new URL(currentUrl);
+            redirectUrl = parsed.protocol + '//' + parsed.host + redirectUrl;
+          }
+          return get(redirectUrl, redirectCount + 1);
         } else if (res.statusCode !== 200) {
-          reject(new Error(`Download failed: ${res.statusCode} for ${currentUrl}`));
+          file.destroy();
+          reject(new Error('Download failed: ' + res.statusCode + ' for ' + currentUrl));
         } else {
           res.pipe(file);
-          file.on('finish', () => { file.close(); resolve(dest); });
+          file.on('finish', function() { file.close(); resolve(dest); });
           file.on('error', reject);
         }
-      }).on('error', reject);
+      }).on('error', function(err) {
+        file.destroy();
+        reject(err);
+      });
     }
-    get(url);
+
+    get(url, 0);
   });
 }
 
-// ─── Helper: ejecutar FFmpeg como Promise ────────────────────────────────────
+// ─── Helper: ejecutar FFmpeg como Promise ─────────────────────────────────────
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y ${args}`;
+    const cmd = 'ffmpeg -y ' + args;
     console.log('[FFmpeg]', cmd.substring(0, 200));
     exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 1800000 }, (err, stdout, stderr) => {
       if (err) {
@@ -68,34 +77,16 @@ function runFFmpeg(args) {
   });
 }
 
-// ─── Limpiar directorio de trabajo ───────────────────────────────────────────
+// ─── Limpiar directorio de trabajo ────────────────────────────────────────────
 function cleanup(dir) {
   try {
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (e) {
     console.error('Cleanup error:', e.message);
   }
 }
 
-// ─── Endpoint principal: POST /render ────────────────────────────────────────
-// Body esperado (compatible con el payload que ya genera creatomate_payload):
-// {
-//   "source": {
-//     "output_format": "mp4",
-//     "width": 1920,
-//     "height": 1080,
-//     "elements": [
-//       { "type": "audio", "track": 2, "source": "https://...", "volume": "100%" },
-//       { "type": "video", "track": 1, "source": "https://...", "fit": "cover", "volume": "0%" }
-//     ]
-//   }
-// }
-//
-// Response:
-// { "id": "uuid", "status": "done", "url": "https://tu-dominio/outputs/uuid.mp4" }
-
+// ─── POST /render ─────────────────────────────────────────────────────────────
 app.post('/render', async (req, res) => {
   const jobId = uuidv4();
   const jobDir = path.join(WORK_DIR, jobId);
@@ -111,130 +102,107 @@ app.post('/render', async (req, res) => {
     const height = source.height || 1080;
     const elements = source.elements;
 
-    // Separar audios y videos
     const audioElements = elements.filter(e => e.type === 'audio');
     const videoElements = elements.filter(e => e.type === 'video');
+    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Videos: ' + videoElements.length);
 
-    console.log(`[${jobId}] Audios: ${audioElements.length}, Videos: ${videoElements.length}`);
-
-    // ── 1. Descargar todos los audios ────────────────────────────────────────
+    // 1. Descargar audios
     const audioPaths = [];
     for (let i = 0; i < audioElements.length; i++) {
-      const audioPath = path.join(jobDir, `audio_${i}.mp3`);
-      console.log(`[${jobId}] Descargando audio ${i + 1}/${audioElements.length}`);
+      const audioPath = path.join(jobDir, 'audio_' + i + '.mp3');
+      console.log('[' + jobId + '] Descargando audio ' + (i + 1) + '/' + audioElements.length);
       await downloadFile(audioElements[i].source, audioPath);
       audioPaths.push(audioPath);
     }
 
-    // ── 2. Concatenar audios en uno solo ────────────────────────────────────
+    // 2. Concatenar audios
     const mergedAudio = path.join(jobDir, 'audio_merged.mp3');
     if (audioPaths.length === 1) {
       fs.copyFileSync(audioPaths[0], mergedAudio);
     } else {
-      // Crear lista para concat
       const listFile = path.join(jobDir, 'audio_list.txt');
-      fs.writeFileSync(listFile, audioPaths.map(p => `file '${p}'`).join('\n'));
-      await runFFmpeg(`-f concat -safe 0 -i "${listFile}" -c copy "${mergedAudio}"`);
+      fs.writeFileSync(listFile, audioPaths.map(p => "file '" + p + "'").join('\n'));
+      await runFFmpeg('-f concat -safe 0 -i "' + listFile + '" -c copy "' + mergedAudio + '"');
     }
 
-    // ── 3. Obtener duración total del audio ──────────────────────────────────
+    // 3. Duración total del audio
     const durationOutput = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${mergedAudio}"`
+      'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + mergedAudio + '"'
     ).toString().trim();
     const totalDuration = parseFloat(durationOutput);
-    console.log(`[${jobId}] Duración total del audio: ${totalDuration}s`);
+    console.log('[' + jobId + '] Duración total: ' + totalDuration + 's');
 
-    // ── 4. Descargar clips de video (solo los necesarios para cubrir duración) ─
-    // Calculamos cuántos clips necesitamos
+    // 4. Descargar clips de video únicos
     const uniqueVideoUrls = [...new Set(videoElements.map(e => e.source))];
-    const videoPaths = [];
-    let totalVideoDuration = 0;
+    const downloadedClips = {};
     let clipIndex = 0;
 
-    // Descargar clips hasta cubrir la duración del audio + 20% margen
-    const targetDuration = totalDuration * 1.2;
-    const videoListForDuration = [];
-
-    // Primero descargamos todos los clips únicos
-    const downloadedClips = {};
     for (const url of uniqueVideoUrls) {
-      const clipPath = path.join(jobDir, `clip_${clipIndex++}.mp4`);
-      console.log(`[${jobId}] Descargando clip ${Object.keys(downloadedClips).length + 1}/${uniqueVideoUrls.length}`);
+      const clipPath = path.join(jobDir, 'clip_' + clipIndex++ + '.mp4');
+      console.log('[' + jobId + '] Descargando clip ' + (clipIndex) + '/' + uniqueVideoUrls.length);
       try {
         await downloadFile(url, clipPath);
-        // Obtener duración del clip
         const clipDur = parseFloat(execSync(
-          `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${clipPath}"`
+          'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + clipPath + '"'
         ).toString().trim());
         downloadedClips[url] = { path: clipPath, duration: clipDur };
-        totalVideoDuration += clipDur;
       } catch (e) {
-        console.warn(`[${jobId}] Error descargando clip: ${e.message}`);
+        console.warn('[' + jobId + '] Error descargando clip: ' + e.message);
       }
     }
 
-    // Construir lista de clips para cubrir la duración (loopeando si es necesario)
+    // 5. Loop de clips hasta cubrir duración
     const clipList = Object.values(downloadedClips);
-    if (clipList.length === 0) {
-      throw new Error('No se pudieron descargar clips de video');
-    }
+    if (clipList.length === 0) throw new Error('No se pudieron descargar clips de video');
 
-    let accDuration = 0;
+    const targetDuration = totalDuration * 1.2;
     const videoListFile = path.join(jobDir, 'video_list.txt');
     const videoListLines = [];
+    let accDuration = 0;
 
     while (accDuration < targetDuration) {
       for (const clip of clipList) {
-        videoListLines.push(`file '${clip.path}'`);
+        videoListLines.push("file '" + clip.path + "'");
         accDuration += clip.duration;
         if (accDuration >= targetDuration) break;
       }
     }
-
     fs.writeFileSync(videoListFile, videoListLines.join('\n'));
-    console.log(`[${jobId}] Lista de video: ${videoListLines.length} clips, ~${accDuration.toFixed(0)}s`);
 
-    // ── 5. Concatenar clips de video ────────────────────────────────────────
+    // 6. Concatenar video
     const mergedVideo = path.join(jobDir, 'video_merged.mp4');
-    await runFFmpeg(`-f concat -safe 0 -i "${videoListFile}" -c copy "${mergedVideo}"`);
+    await runFFmpeg('-f concat -safe 0 -i "' + videoListFile + '" -c copy "' + mergedVideo + '"');
 
-    // ── 6. Combinar video + audio, recortar al largo del audio ──────────────
-    const outputFile = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+    // 7. Combinar video + audio
+    const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
     await runFFmpeg(
-      `-i "${mergedVideo}" -i "${mergedAudio}" ` +
-      `-map 0:v:0 -map 1:a:0 ` +
-      `-t ${totalDuration} ` +
-      `-vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black" ` +
-      `-c:v libx264 -preset fast -crf 22 ` +
-      `-c:a aac -b:a 192k ` +
-      `-movflags +faststart ` +
-      `"${outputFile}"`
+      '-i "' + mergedVideo + '" -i "' + mergedAudio + '" ' +
+      '-map 0:v:0 -map 1:a:0 ' +
+      '-t ' + totalDuration + ' ' +
+      '-vf "scale=' + width + ':' + height + ':force_original_aspect_ratio=decrease,pad=' + width + ':' + height + ':(ow-iw)/2:(oh-ih)/2:black" ' +
+      '-c:v libx264 -preset fast -crf 22 ' +
+      '-c:a aac -b:a 192k ' +
+      '-movflags +faststart ' +
+      '"' + outputFile + '"'
     );
 
-    // ── 7. Limpiar archivos temporales ───────────────────────────────────────
     cleanup(jobDir);
 
-    const host = req.headers.host;
     const protocol = req.headers['x-forwarded-proto'] || 'https';
-    const videoUrl = `${protocol}://${host}/outputs/${jobId}.mp4`;
+    const host = req.headers.host;
+    const videoUrl = protocol + '://' + host + '/outputs/' + jobId + '.mp4';
+    console.log('[' + jobId + '] ✅ Render completado: ' + videoUrl);
 
-    console.log(`[${jobId}] ✅ Render completado: ${videoUrl}`);
-
-    // Respuesta compatible con el poll que ya hace el workflow
-    return res.json([{
-      id: jobId,
-      status: 'succeeded',
-      url: videoUrl
-    }]);
+    return res.json([{ id: jobId, status: 'succeeded', url: videoUrl }]);
 
   } catch (err) {
     cleanup(jobDir);
-    console.error(`[${jobId}] ❌ Error:`, err.message);
+    console.error('[' + jobId + '] ❌ Error:', err.message);
     return res.status(500).json({ error: err.message, id: jobId });
   }
 });
 
-// ─── Servir los outputs ───────────────────────────────────────────────────────
+// ─── Servir outputs ───────────────────────────────────────────────────────────
 app.use('/outputs', express.static(OUTPUT_DIR));
 
 // ─── Health check ─────────────────────────────────────────────────────────────
@@ -242,7 +210,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', outputs: fs.readdirSync(OUTPUT_DIR).length });
 });
 
-// ─── Limpiar outputs viejos (más de 48h) ──────────────────────────────────────
+// ─── Limpiar outputs viejos (más de 48h) ─────────────────────────────────────
 setInterval(() => {
   try {
     const files = fs.readdirSync(OUTPUT_DIR);
@@ -256,9 +224,9 @@ setInterval(() => {
       }
     });
   } catch (e) {}
-}, 60 * 60 * 1000); // cada hora
+}, 60 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🎬 FFmpeg Renderer API corriendo en puerto ${PORT}`);
+  console.log('🎬 FFmpeg Renderer API corriendo en puerto ' + PORT);
 });
