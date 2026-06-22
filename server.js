@@ -16,18 +16,25 @@ const OUTPUT_DIR = '/app/outputs';
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
+// ─── Helper: agrega confirm=t a cualquier URL de Google Drive ────────────────
+function gdriveConfirm(u) {
+  if ((u.includes('drive.google.com') || u.includes('drive.usercontent.google.com')) && !u.includes('confirm=')) {
+    return u + (u.includes('?') ? '&' : '?') + 'confirm=t';
+  }
+  return u;
+}
+
 // ─── Helper: descargar archivo siguiendo todos los redirects ──────────────────
 function downloadFile(url, dest) {
-  // Google Drive: add confirm=t to bypass virus-scan confirmation page
-  if ((url.includes('drive.google.com') || url.includes('drive.usercontent.google.com')) && !url.includes('confirm=')) {
-    url += '&confirm=t';
-  }
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
 
     function get(currentUrl, redirectCount) {
       if (redirectCount === undefined) redirectCount = 0;
-      if (redirectCount > 10) return reject(new Error('Too many redirects'));
+      if (redirectCount > 15) return reject(new Error('Too many redirects'));
+
+      // Aplicar confirm=t en CADA paso del chain (no solo la URL inicial)
+      currentUrl = gdriveConfirm(currentUrl);
 
       const protocol = currentUrl.startsWith('https') ? https : http;
       const options = {
@@ -39,9 +46,8 @@ function downloadFile(url, dest) {
 
       protocol.get(currentUrl, options, function(res) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume(); // descartar body del redirect
+          res.resume();
           var redirectUrl = res.headers.location;
-          // manejar redirects relativos
           if (redirectUrl.startsWith('/')) {
             var parsed = new URL(currentUrl);
             redirectUrl = parsed.protocol + '//' + parsed.host + redirectUrl;
@@ -51,6 +57,13 @@ function downloadFile(url, dest) {
           file.destroy();
           reject(new Error('Download failed: ' + res.statusCode + ' for ' + currentUrl));
         } else {
+          // Si Google devuelve HTML es la página de confirmación — el confirm=t no funcionó
+          const ct = res.headers['content-type'] || '';
+          if (ct.includes('text/html')) {
+            res.resume();
+            file.destroy();
+            return reject(new Error('Google Drive devolvio pagina HTML en vez del archivo. URL: ' + currentUrl));
+          }
           res.pipe(file);
           file.on('finish', function() { file.close(); resolve(dest); });
           file.on('error', reject);
