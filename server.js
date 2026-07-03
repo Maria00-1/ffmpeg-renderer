@@ -119,9 +119,11 @@ app.post('/render', async (req, res) => {
     const height = source.height || 1080;
     const elements = source.elements;
 
-    const audioElements = elements.filter(e => e.type === 'audio');
+    // role: 'music' distingue la cama musical de la narración. Sin role -> narración (compatible con payloads existentes)
+    const audioElements = elements.filter(e => e.type === 'audio' && e.role !== 'music');
+    const musicElements = elements.filter(e => e.type === 'audio' && e.role === 'music');
     const videoElements = elements.filter(e => e.type === 'video');
-    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Videos: ' + videoElements.length);
+    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Musica: ' + musicElements.length + ', Videos: ' + videoElements.length);
 
     // 1. Descargar audios
     const audioPaths = [];
@@ -148,6 +150,39 @@ app.post('/render', async (req, res) => {
     ).toString().trim();
     const totalDuration = parseFloat(durationOutput);
     console.log('[' + jobId + '] Duración total: ' + totalDuration + 's');
+
+    // 3b. Mezclar música de fondo (si se envió un elemento con role:'music')
+    let finalAudio = mergedAudio;
+    if (musicElements.length > 0) {
+      try {
+        const musicRaw = path.join(jobDir, 'music_raw.mp3');
+        console.log('[' + jobId + '] Descargando musica de fondo');
+        await downloadFile(musicElements[0].source, musicRaw);
+
+        const musicLooped = path.join(jobDir, 'music_looped.mp3');
+        await runFFmpeg('-stream_loop -1 -i "' + musicRaw + '" -t ' + totalDuration + ' -c:a libmp3lame -ar 44100 -ac 2 "' + musicLooped + '"');
+
+        // volume acepta '12%' (string) o 0.12 (number). Default: 12% -> cama discreta bajo la narración
+        const volumeRaw = musicElements[0].volume;
+        let musicVolume = 0.12;
+        if (typeof volumeRaw === 'string' && volumeRaw.includes('%')) {
+          musicVolume = parseFloat(volumeRaw) / 100;
+        } else if (typeof volumeRaw === 'number') {
+          musicVolume = volumeRaw;
+        }
+
+        const mixedAudio = path.join(jobDir, 'audio_with_music.mp3');
+        await runFFmpeg(
+          '-i "' + mergedAudio + '" -i "' + musicLooped + '" ' +
+          '-filter_complex "[1:a]volume=' + musicVolume + '[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=3[aout]" ' +
+          '-map "[aout]" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mixedAudio + '"'
+        );
+        finalAudio = mixedAudio;
+        console.log('[' + jobId + '] Musica de fondo mezclada (volumen ' + musicVolume + ')');
+      } catch (e) {
+        console.warn('[' + jobId + '] Error mezclando musica, se continua sin ella: ' + e.message);
+      }
+    }
 
     // 4. Descargar clips de video únicos
     const uniqueVideoUrls = [...new Set(videoElements.map(e => e.source))];
@@ -193,7 +228,7 @@ app.post('/render', async (req, res) => {
     // 7. Combinar video + audio
     const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
     await runFFmpeg(
-      '-i "' + mergedVideo + '" -i "' + mergedAudio + '" ' +
+      '-i "' + mergedVideo + '" -i "' + finalAudio + '" ' +
       '-map 0:v:0 -map 1:a:0 ' +
       '-t ' + totalDuration + ' ' +
       '-vf "scale=' + width + ':' + height + ':force_original_aspect_ratio=decrease,pad=' + width + ':' + height + ':(ow-iw)/2:(oh-ih)/2:black" ' +
