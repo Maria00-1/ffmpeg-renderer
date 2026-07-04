@@ -122,8 +122,8 @@ app.post('/render', async (req, res) => {
     // role: 'music' distingue la cama musical de la narración. Sin role -> narración (compatible con payloads existentes)
     const audioElements = elements.filter(e => e.type === 'audio' && e.role !== 'music');
     const musicElements = elements.filter(e => e.type === 'audio' && e.role === 'music');
-    const videoElements = elements.filter(e => e.type === 'video');
-    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Musica: ' + musicElements.length + ', Videos: ' + videoElements.length);
+    const imageElements = elements.filter(e => e.type === 'image').sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0));
+    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Musica: ' + musicElements.length + ', Escenas: ' + imageElements.length);
 
     // 1. Descargar audios
     const audioPaths = [];
@@ -184,45 +184,59 @@ app.post('/render', async (req, res) => {
       }
     }
 
-    // 4. Descargar clips de video únicos
-    const uniqueVideoUrls = [...new Set(videoElements.map(e => e.source))];
-    const downloadedClips = {};
-    let clipIndex = 0;
+    // 4. Descargar imágenes de escena (concurrencia limitada — Pollinations tarda varios
+    // segundos por imagen, secuencial habría añadido ~15min al render con 80-90 escenas)
+    if (imageElements.length === 0) throw new Error('No se recibieron escenas de imagen');
 
-    for (const url of uniqueVideoUrls) {
-      const clipPath = path.join(jobDir, 'clip_' + clipIndex++ + '.mp4');
-      console.log('[' + jobId + '] Descargando clip ' + (clipIndex) + '/' + uniqueVideoUrls.length);
-      try {
-        await downloadFile(url, clipPath);
-        const clipDur = parseFloat(execSync(
-          'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + clipPath + '"'
-        ).toString().trim());
-        downloadedClips[url] = { path: clipPath, duration: clipDur };
-      } catch (e) {
-        console.warn('[' + jobId + '] Error descargando clip: ' + e.message);
+    const scenePaths = new Array(imageElements.length);
+    const DOWNLOAD_CONCURRENCY = 5;
+    let nextDl = 0;
+    async function downloadWorker() {
+      while (nextDl < imageElements.length) {
+        const i = nextDl++;
+        const imgPath = path.join(jobDir, 'scene_' + i + '.jpg');
+        console.log('[' + jobId + '] Descargando escena ' + (i + 1) + '/' + imageElements.length);
+        await downloadFile(imageElements[i].source, imgPath);
+        scenePaths[i] = imgPath;
       }
     }
+    await Promise.all(
+      Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, imageElements.length) }, downloadWorker)
+    );
 
-    // 5. Loop de clips hasta cubrir duración
-    const clipList = Object.values(downloadedClips);
-    if (clipList.length === 0) throw new Error('No se pudieron descargar clips de video');
+    // 5. Escalar duraciones de escena para que la suma cuadre exacto con el audio real
+    // (el n8n solo manda una estimación por palabras; el ajuste fino se hace aquí porque
+    // totalDuration real del audio narrado solo se conoce tras el ffprobe del paso 3)
+    const rawDurs = imageElements.map(e => Math.max(parseFloat(e.dur) || 3, 3));
+    const rawSum = rawDurs.reduce((a, b) => a + b, 0);
+    const scale = totalDuration / rawSum;
+    const scaledDurs = rawDurs.map(d => d * scale);
+    const roundedSum = scaledDurs.reduce((a, b) => a + b, 0);
+    scaledDurs[scaledDurs.length - 1] += (totalDuration - roundedSum);
 
-    const targetDuration = totalDuration * 1.2;
-    const videoListFile = path.join(jobDir, 'video_list.txt');
-    const videoListLines = [];
-    let accDuration = 0;
-
-    while (accDuration < targetDuration) {
-      for (const clip of clipList) {
-        videoListLines.push("file '" + clip.path + "'");
-        accDuration += clip.duration;
-        if (accDuration >= targetDuration) break;
-      }
+    // 6. Renderizar cada escena con efecto Ken Burns (zoom in/out alternado por índice)
+    const sceneClipPaths = [];
+    for (let i = 0; i < imageElements.length; i++) {
+      const dur = scaledDurs[i];
+      const frames = Math.max(Math.round(dur * 25), 1);
+      const zoomExpr = (i % 2 === 0)
+        ? "min(zoom+0.0008,1.15)"
+        : "max(1.15-0.0008*on,1.0)";
+      const clipPath = path.join(jobDir, 'clip_' + i + '.mp4');
+      const vf = 'scale=2400:-2,zoompan=z=\'' + zoomExpr + '\':d=' + frames +
+        ':x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1920x1080:fps=25,' +
+        'fade=t=in:d=0.5,fade=t=out:st=' + Math.max(dur - 0.5, 0) + ':d=0.5';
+      await runFFmpeg(
+        '-loop 1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+        '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+      );
+      sceneClipPaths.push(clipPath);
     }
-    fs.writeFileSync(videoListFile, videoListLines.join('\n'));
 
-    // 6. Concatenar video
+    // 7. Concatenar las escenas ya renderizadas
     const mergedVideo = path.join(jobDir, 'video_merged.mp4');
+    const videoListFile = path.join(jobDir, 'video_list.txt');
+    fs.writeFileSync(videoListFile, sceneClipPaths.map(p => "file '" + p + "'").join('\n'));
     await runFFmpeg('-f concat -safe 0 -i "' + videoListFile + '" -c copy "' + mergedVideo + '"');
 
     // 7. Combinar video + audio
