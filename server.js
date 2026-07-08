@@ -102,11 +102,13 @@ async function downloadFileWithRetry(url, dest, maxRetries) {
   throw lastErr;
 }
 
-// ─── Helper: gate global de ritmo — Pollinations es gratis y rate-limita por
-// IP/tiempo, no solo por concurrencia. Sin esto, incluso con concurrencia baja
-// y reintentos, varias escenas en paralelo pueden saturar el límite a la vez.
+// ─── Helper: gate global de ritmo — Pollinations documenta el límite anónimo
+// en 1 petición cada 15s (no por conexión concurrente, es una ventana de tiempo
+// real). 1.2s se quedaba corto por un orden de magnitud. Si Edgar registra un
+// token gratis en auth.pollinations.ai (tier "Seed", 1 req/5s), este valor se
+// puede bajar a ~6000ms.
 let nextAllowedStart = 0;
-const PACING_MS = 1200;
+const PACING_MS = 16000;
 async function paceRequest() {
   const now = Date.now();
   const waitMs = Math.max(nextAllowedStart - now, 0);
