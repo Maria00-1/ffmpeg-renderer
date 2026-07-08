@@ -233,7 +233,11 @@ app.post('/render', async (req, res) => {
       while (nextDl < imageElements.length) {
         const i = nextDl++;
         const imgPath = path.join(jobDir, 'scene_' + i + '.jpg');
-        await paceRequest();
+        // El pacing solo protege contra el rate limit de Pollinations; para fuentes
+        // normales (Drive, CDN) espaciar 16s por imagen solo alarga el render.
+        if ((imageElements[i].source || '').includes('pollinations.ai')) {
+          await paceRequest();
+        }
         console.log('[' + jobId + '] Descargando escena ' + (i + 1) + '/' + imageElements.length);
         await downloadFileWithRetry(imageElements[i].source, imgPath);
         scenePaths[i] = imgPath;
