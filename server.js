@@ -290,11 +290,14 @@ app.post('/render', async (req, res) => {
       '"' + narrationCombined + '"'
     );
 
-    // 9. Anteponer el intro de marca (horneado en /app/assets/intro.mp4 en el Docker build).
-    // Degrada a narración sola si el asset no existe, mismo patrón defensivo que la mezcla de musica.
+    // 9. Anteponer el intro de marca (horneado en /app/assets/intro.mp4 en el Docker build)
+    // SOLO si el payload lo pide (source.intro truthy, ej. intro:'collapse'). El renderer es
+    // compartido entre canales: sin flag el video sale sin intro (Dark LATAM no manda flag).
+    // Degrada a narración sola si el asset no existe, mismo patrón defensivo que la musica.
     const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
     const introPath = '/app/assets/intro.mp4';
-    if (fs.existsSync(introPath)) {
+    const introRequested = !!source.intro;
+    if (introRequested && fs.existsSync(introPath)) {
       await runFFmpeg(
         '-i "' + introPath + '" -i "' + narrationCombined + '" -filter_complex ' +
         '"[0:v]scale=' + width + ':' + height + ',setsar=1,fps=25[iv];[1:v]setsar=1,fps=25[nv];' +
@@ -305,7 +308,9 @@ app.post('/render', async (req, res) => {
       );
     } else {
       fs.copyFileSync(narrationCombined, outputFile);
-      console.warn('[' + jobId + '] intro.mp4 no encontrado en la imagen, se publica sin intro');
+      if (introRequested) {
+        console.warn('[' + jobId + '] intro solicitado pero intro.mp4 no existe en la imagen, se publica sin intro');
+      }
     }
 
     cleanup(jobDir);
