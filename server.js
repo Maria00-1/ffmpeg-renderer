@@ -160,8 +160,10 @@ app.post('/render', async (req, res) => {
     // role: 'music' distingue la cama musical de la narración. Sin role -> narración (compatible con payloads existentes)
     const audioElements = elements.filter(e => e.type === 'audio' && e.role !== 'music');
     const musicElements = elements.filter(e => e.type === 'audio' && e.role === 'music');
-    const imageElements = elements.filter(e => e.type === 'image').sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0));
-    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Musica: ' + musicElements.length + ', Escenas: ' + imageElements.length);
+    // Escenas visuales: clips de video reales (stock) e imagenes (Ken Burns), mezclables
+    const imageElements = elements.filter(e => e.type === 'image' || e.type === 'video').sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0));
+    const videoCount = imageElements.filter(e => e.type === 'video').length;
+    console.log('[' + jobId + '] Audios: ' + audioElements.length + ', Musica: ' + musicElements.length + ', Escenas: ' + imageElements.length + ' (' + videoCount + ' video, ' + (imageElements.length - videoCount) + ' imagen)');
 
     // 1. Descargar audios
     const audioPaths = [];
@@ -232,9 +234,10 @@ app.post('/render', async (req, res) => {
     async function downloadWorker() {
       while (nextDl < imageElements.length) {
         const i = nextDl++;
-        const imgPath = path.join(jobDir, 'scene_' + i + '.jpg');
+        const ext = imageElements[i].type === 'video' ? '.mp4' : '.jpg';
+        const imgPath = path.join(jobDir, 'scene_' + i + ext);
         // El pacing solo protege contra el rate limit de Pollinations; para fuentes
-        // normales (Drive, CDN) espaciar 16s por imagen solo alarga el render.
+        // normales (Drive, Pexels, CDN) espaciar 16s por elemento solo alarga el render.
         if ((imageElements[i].source || '').includes('pollinations.ai')) {
           await paceRequest();
         }
@@ -257,22 +260,33 @@ app.post('/render', async (req, res) => {
     const roundedSum = scaledDurs.reduce((a, b) => a + b, 0);
     scaledDurs[scaledDurs.length - 1] += (totalDuration - roundedSum);
 
-    // 6. Renderizar cada escena con efecto Ken Burns (zoom in/out alternado por índice)
+    // 6. Renderizar cada escena: clips de video reales se recortan/loopean a la duración
+    // de la escena (sin su audio original); las imágenes llevan efecto Ken Burns
+    // (zoom in/out alternado por índice). Todos salen uniformes: 1920x1080, 25fps, h264.
     const sceneClipPaths = [];
     for (let i = 0; i < imageElements.length; i++) {
       const dur = scaledDurs[i];
-      const frames = Math.max(Math.round(dur * 25), 1);
-      const zoomExpr = (i % 2 === 0)
-        ? "min(zoom+0.0008,1.15)"
-        : "max(1.15-0.0008*on,1.0)";
       const clipPath = path.join(jobDir, 'clip_' + i + '.mp4');
-      const vf = 'scale=2400:-2,zoompan=z=\'' + zoomExpr + '\':d=' + frames +
-        ':x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1920x1080:fps=25,' +
-        'fade=t=in:d=0.5,fade=t=out:st=' + Math.max(dur - 0.5, 0) + ':d=0.5';
-      await runFFmpeg(
-        '-loop 1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
-        '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
-      );
+      if (imageElements[i].type === 'video') {
+        const vfVid = 'scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=25,' +
+          'fade=t=in:d=0.5,fade=t=out:st=' + Math.max(dur - 0.5, 0) + ':d=0.5';
+        await runFFmpeg(
+          '-stream_loop -1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vfVid + '" ' +
+          '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      } else {
+        const frames = Math.max(Math.round(dur * 25), 1);
+        const zoomExpr = (i % 2 === 0)
+          ? "min(zoom+0.0008,1.15)"
+          : "max(1.15-0.0008*on,1.0)";
+        const vf = 'scale=2400:-2,zoompan=z=\'' + zoomExpr + '\':d=' + frames +
+          ':x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1920x1080:fps=25,' +
+          'fade=t=in:d=0.5,fade=t=out:st=' + Math.max(dur - 0.5, 0) + ':d=0.5';
+        await runFFmpeg(
+          '-loop 1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      }
       sceneClipPaths.push(clipPath);
     }
 
