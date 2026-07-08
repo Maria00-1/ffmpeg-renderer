@@ -239,18 +239,35 @@ app.post('/render', async (req, res) => {
     fs.writeFileSync(videoListFile, sceneClipPaths.map(p => "file '" + p + "'").join('\n'));
     await runFFmpeg('-f concat -safe 0 -i "' + videoListFile + '" -c copy "' + mergedVideo + '"');
 
-    // 7. Combinar video + audio
-    const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
+    // 8. Combinar video de escenas + audio narración/música (duración exacta de la narración)
+    const narrationCombined = path.join(jobDir, 'narration_combined.mp4');
     await runFFmpeg(
       '-i "' + mergedVideo + '" -i "' + finalAudio + '" ' +
       '-map 0:v:0 -map 1:a:0 ' +
       '-t ' + totalDuration + ' ' +
       '-vf "scale=' + width + ':' + height + ':force_original_aspect_ratio=decrease,pad=' + width + ':' + height + ':(ow-iw)/2:(oh-ih)/2:black" ' +
-      '-c:v libx264 -preset fast -crf 22 ' +
+      '-c:v libx264 -preset veryfast -crf 22 ' +
       '-c:a aac -b:a 192k ' +
-      '-movflags +faststart ' +
-      '"' + outputFile + '"'
+      '"' + narrationCombined + '"'
     );
+
+    // 9. Anteponer el intro de marca (horneado en /app/assets/intro.mp4 en el Docker build).
+    // Degrada a narración sola si el asset no existe, mismo patrón defensivo que la mezcla de musica.
+    const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
+    const introPath = '/app/assets/intro.mp4';
+    if (fs.existsSync(introPath)) {
+      await runFFmpeg(
+        '-i "' + introPath + '" -i "' + narrationCombined + '" -filter_complex ' +
+        '"[0:v]scale=' + width + ':' + height + ',setsar=1,fps=25[iv];[1:v]setsar=1,fps=25[nv];' +
+        '[iv][0:a][nv][1:a]concat=n=2:v=1:a=1[outv][outa]" ' +
+        '-map "[outv]" -map "[outa]" ' +
+        '-c:v libx264 -preset fast -crf 22 -c:a aac -b:a 192k -movflags +faststart ' +
+        '"' + outputFile + '"'
+      );
+    } else {
+      fs.copyFileSync(narrationCombined, outputFile);
+      console.warn('[' + jobId + '] intro.mp4 no encontrado en la imagen, se publica sin intro');
+    }
 
     cleanup(jobDir);
 
