@@ -78,6 +78,29 @@ function downloadFile(url, dest) {
   });
 }
 
+// ─── Helper: reintentar una descarga con backoff (Pollinations es gratis y
+// devuelve 429 bajo concurrencia; sin esto un solo rate-limit tira todo el render) ──
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function downloadFileWithRetry(url, dest, maxRetries) {
+  if (maxRetries === undefined) maxRetries = 4;
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await downloadFile(url, dest);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < maxRetries) {
+        const backoff = 2000 * Math.pow(2, attempt);
+        console.warn('[retry] ' + e.message + ' -> reintentando en ' + backoff + 'ms (intento ' + (attempt + 1) + '/' + maxRetries + ')');
+        await sleep(backoff);
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ─── Helper: ejecutar FFmpeg como Promise ─────────────────────────────────────
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
@@ -189,14 +212,14 @@ app.post('/render', async (req, res) => {
     if (imageElements.length === 0) throw new Error('No se recibieron escenas de imagen');
 
     const scenePaths = new Array(imageElements.length);
-    const DOWNLOAD_CONCURRENCY = 5;
+    const DOWNLOAD_CONCURRENCY = 3;
     let nextDl = 0;
     async function downloadWorker() {
       while (nextDl < imageElements.length) {
         const i = nextDl++;
         const imgPath = path.join(jobDir, 'scene_' + i + '.jpg');
         console.log('[' + jobId + '] Descargando escena ' + (i + 1) + '/' + imageElements.length);
-        await downloadFile(imageElements[i].source, imgPath);
+        await downloadFileWithRetry(imageElements[i].source, imgPath);
         scenePaths[i] = imgPath;
       }
     }
