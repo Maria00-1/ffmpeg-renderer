@@ -83,7 +83,8 @@ function downloadFile(url, dest) {
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function downloadFileWithRetry(url, dest, maxRetries) {
-  if (maxRetries === undefined) maxRetries = 4;
+  if (maxRetries === undefined) maxRetries = 6;
+  const MAX_BACKOFF_MS = 20000;
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -92,13 +93,25 @@ async function downloadFileWithRetry(url, dest, maxRetries) {
     } catch (e) {
       lastErr = e;
       if (attempt < maxRetries) {
-        const backoff = 2000 * Math.pow(2, attempt);
+        const backoff = Math.min(2000 * Math.pow(2, attempt), MAX_BACKOFF_MS);
         console.warn('[retry] ' + e.message + ' -> reintentando en ' + backoff + 'ms (intento ' + (attempt + 1) + '/' + maxRetries + ')');
         await sleep(backoff);
       }
     }
   }
   throw lastErr;
+}
+
+// ─── Helper: gate global de ritmo — Pollinations es gratis y rate-limita por
+// IP/tiempo, no solo por concurrencia. Sin esto, incluso con concurrencia baja
+// y reintentos, varias escenas en paralelo pueden saturar el límite a la vez.
+let nextAllowedStart = 0;
+const PACING_MS = 1200;
+async function paceRequest() {
+  const now = Date.now();
+  const waitMs = Math.max(nextAllowedStart - now, 0);
+  nextAllowedStart = Math.max(now, nextAllowedStart) + PACING_MS;
+  if (waitMs > 0) await sleep(waitMs);
 }
 
 // ─── Helper: ejecutar FFmpeg como Promise ─────────────────────────────────────
@@ -212,12 +225,13 @@ app.post('/render', async (req, res) => {
     if (imageElements.length === 0) throw new Error('No se recibieron escenas de imagen');
 
     const scenePaths = new Array(imageElements.length);
-    const DOWNLOAD_CONCURRENCY = 3;
+    const DOWNLOAD_CONCURRENCY = 2;
     let nextDl = 0;
     async function downloadWorker() {
       while (nextDl < imageElements.length) {
         const i = nextDl++;
         const imgPath = path.join(jobDir, 'scene_' + i + '.jpg');
+        await paceRequest();
         console.log('[' + jobId + '] Descargando escena ' + (i + 1) + '/' + imageElements.length);
         await downloadFileWithRetry(imageElements[i].source, imgPath);
         scenePaths[i] = imgPath;
