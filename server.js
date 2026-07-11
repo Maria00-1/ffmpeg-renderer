@@ -444,6 +444,67 @@ async function generateImageReplicate(token, prompt, seed, jobId, idx) {
   throw lastErr;
 }
 
+// ─── Animar una imagen fija (image-to-video) ──────────────────────────────────
+// Convierte el plano en movimiento REAL dentro del encuadre (la llama parpadea, la
+// mano escribe, la camara entra) en vez de un Ken Burns sobre una foto quieta.
+// Medido: ~22s de computo por clip de 5s => ~0,02-0,03 USD por plano.
+// Si falla, se devuelve null y el plano cae de vuelta a imagen + Ken Burns: animar
+// es una mejora, nunca un punto de fallo que tumbe el video.
+const WAN_MODEL_URL = 'https://api.replicate.com/v1/models/wan-video/wan-2.2-i2v-fast/predictions';
+
+async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId, idx, resolution) {
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await paceReplicate();
+
+      const res = await fetch(WAN_MODEL_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Content-Type': 'application/json',
+          'Prefer': 'wait=60'
+        },
+        body: JSON.stringify({
+          input: {
+            image: imageUrl,
+            prompt: motionPrompt || 'subtle natural movement in the scene, gentle slow camera push in, soft shifting light',
+            num_frames: 81,
+            frames_per_second: 16,
+            resolution: resolution || '480p',
+            seed: seed
+          }
+        })
+      });
+
+      if (res.status === 429) throw new Error('429 rate limit');
+      if (!res.ok && res.status !== 201 && res.status !== 202) {
+        throw new Error('wan ' + res.status + ': ' + (await res.text()).slice(0, 150));
+      }
+
+      let pred = await res.json();
+      const DEADLINE = Date.now() + 300000;
+      while (pred.status !== 'succeeded' && pred.status !== 'failed' && pred.status !== 'canceled') {
+        if (Date.now() > DEADLINE) throw new Error('timeout animando');
+        await sleep(3000);
+        const pr = await fetch(pred.urls.get, { headers: { 'Authorization': 'Bearer ' + token } });
+        if (!pr.ok) throw new Error('poll ' + pr.status);
+        pred = await pr.json();
+      }
+      if (pred.status !== 'succeeded') throw new Error('animacion ' + pred.status + ': ' + (pred.error || ''));
+
+      const url = Array.isArray(pred.output) ? pred.output[0] : pred.output;
+      if (!url) throw new Error('animacion sin output');
+      return url;
+
+    } catch (e) {
+      console.warn('[' + jobId + '] animar escena ' + idx + ' intento ' + attempt + ': ' + e.message);
+      if (attempt < MAX_ATTEMPTS) await sleep(5000 * attempt);
+    }
+  }
+  return null; // degrada a imagen fija + Ken Burns
+}
+
 // Movimiento de cámara variado. Con planos de ~5s, repetir siempre el mismo zoom
 // delata el automatismo; alternar 6 patrones es lo que da sensación de montaje.
 // La imagen entra escalada a 2400px de ancho para que el zoompan tenga margen real
@@ -540,8 +601,12 @@ app.post('/render-v2', async (req, res) => {
     const scenePaths = new Array(scenes.length).fill(null);
     const sceneTypes = new Array(scenes.length).fill('image');
     const CONCURRENCY = 4;
+    const animarGlobal = body.animate === true;
+    const resolucionAnim = body.animate_resolution || '480p';
     let nextScene = 0;
     let generated = 0;
+    let animated = 0;
+    let animFallidas = 0;
 
     async function sceneWorker() {
       while (nextScene < scenes.length) {
@@ -549,7 +614,7 @@ app.post('/render-v2', async (req, res) => {
         const s = scenes[i];
         try {
           let url = s.source;
-          const isVideo = s.type === 'video';
+          let isVideo = s.type === 'video';
 
           if (!url) {
             url = await generateImageReplicate(
@@ -560,7 +625,23 @@ app.post('/render-v2', async (req, res) => {
               i
             );
             generated++;
-            console.log('[' + jobId + '] escena ' + (i + 1) + '/' + scenes.length + ' generada (' + generated + ' ok)');
+
+            // Animar el plano recien generado. `animate: false` en la escena permite
+            // dejar planos concretos como imagen fija (mas barato) sin tocar el resto.
+            if (animarGlobal && s.animate !== false) {
+              const vid = await animateImageReplicate(
+                token, url, s.motion, (typeof s.seed === 'number' ? s.seed : (1000 + i)), jobId, i, resolucionAnim
+              );
+              if (vid) {
+                url = vid;
+                isVideo = true;
+                animated++;
+              } else {
+                animFallidas++;
+              }
+            }
+            console.log('[' + jobId + '] escena ' + (i + 1) + '/' + scenes.length +
+              ' lista (' + (isVideo ? 'animada' : 'fija') + ') — ' + animated + ' animadas de ' + generated);
           }
 
           const ext = isVideo ? '.mp4' : '.jpg';
@@ -655,7 +736,9 @@ app.post('/render-v2', async (req, res) => {
       duracion_seg: totalDuration,
       escenas_total: scenes.length,
       escenas_ok: okCount,
-      escenas_rellenadas: scenes.length - okCount
+      escenas_rellenadas: scenes.length - okCount,
+      escenas_animadas: animated,
+      animaciones_fallidas: animFallidas
     });
 
   } catch (err) {
