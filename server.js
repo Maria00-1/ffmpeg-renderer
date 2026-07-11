@@ -798,6 +798,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     outputs: fs.readdirSync(OUTPUT_DIR).length,
     render_v2: true,
+    // EasyPanel no redespliega solo tras un push y no habia forma de saber que version
+    // corria de verdad. Con el commit expuesto aqui, verificar un deploy es una peticion.
+    git_sha: (process.env.GIT_SHA || 'desconocido').slice(0, 7),
+    deploy: process.env.DEPLOY_TIMESTAMP || 'desconocido',
     replicate_token_presente: !!process.env.REPLICATE_API_TOKEN,
     env_keys: envKeys
   });
