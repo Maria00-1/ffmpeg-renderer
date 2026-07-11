@@ -670,7 +670,16 @@ app.use('/outputs', express.static(OUTPUT_DIR));
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', outputs: fs.readdirSync(OUTPUT_DIR).length });
+  // Se reportan solo NOMBRES de variables, nunca valores: sirve para diagnosticar
+  // "la variable esta guardada en el panel pero el contenedor no la ve" sin filtrar secretos.
+  const envKeys = Object.keys(process.env).filter(k => !/^(npm_|PATH|HOME|HOSTNAME|PWD|SHLVL|_$)/.test(k)).sort();
+  res.json({
+    status: 'ok',
+    outputs: fs.readdirSync(OUTPUT_DIR).length,
+    render_v2: true,
+    replicate_token_presente: !!process.env.REPLICATE_API_TOKEN,
+    env_keys: envKeys
+  });
 });
 
 // ─── Limpiar outputs viejos (más de 48h) ─────────────────────────────────────
