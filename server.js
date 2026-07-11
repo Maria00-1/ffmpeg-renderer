@@ -378,15 +378,30 @@ async function paceReplicate() {
 // dentro de la ventana `Prefer: wait`, hace polling — el bug que rompía el pipeline
 // viejo era tratar ese caso (HTTP 202 "starting") como un fallo: la imagen se estaba
 // generando bien, simplemente aún no estaba lista.
+// Simplifica un prompt que Replicate rechaza. Hay prompts que fallan SIEMPRE con
+// `E9828 Director: unexpected error` (comprobado: el mismo prompt fallo 3 veces seguidas
+// mientras otro funcionaba a la primera), asi que reintentarlo identico no sirve de nada
+// — solo gasta tiempo y acaba en un plano duplicado, que es justo lo que hay que evitar.
+// Se le quita la cola de estilo, se recorta y se cambia la semilla.
+function simplificarPrompt(prompt) {
+  const sinEstilo = prompt.split(/,\s*(?:stylized 2D|cinematic|no text)/i)[0];
+  const palabras = sinEstilo.split(/\s+/).slice(0, 18).join(' ').replace(/[^a-zA-Z0-9 ,.'-]/g, '');
+  return palabras + ', hand drawn 2D illustration, flat color, historical scene, no text';
+}
+
 async function generateImageReplicate(token, prompt, seed, jobId, idx) {
-  // 5 intentos, no 3: con 100 imagenes seguidas, 3 se quedaba corto y ~10 planos se
-  // perdian. Un plano perdido se rellena con el vecino, y eso se ve como una imagen
-  // repetida — justo lo que Edgar detecto y rechazo. Reintentar sale mucho mas barato
-  // (0,003 USD) que un plano duplicado en el video final.
   const MAX_ATTEMPTS = 5;
+  const SIMPLIFICAR_DESDE = 3; // los 2 primeros intentos con el prompt original
   let lastErr;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const usarSimple = attempt >= SIMPLIFICAR_DESDE;
+    const promptActual = usarSimple ? simplificarPrompt(prompt) : prompt;
+    const seedActual = usarSimple ? (seed + attempt * 137) : seed;
+    if (usarSimple && attempt === SIMPLIFICAR_DESDE) {
+      console.warn('[' + jobId + '] escena ' + idx + ': el prompt original falla, probando version simplificada');
+    }
+
     try {
       await paceReplicate();
 
@@ -399,12 +414,12 @@ async function generateImageReplicate(token, prompt, seed, jobId, idx) {
         },
         body: JSON.stringify({
           input: {
-            prompt: prompt,
+            prompt: promptActual,
             aspect_ratio: '16:9',
             num_outputs: 1,
             output_format: 'jpg',
             output_quality: 90,
-            seed: seed
+            seed: seedActual
           }
         })
       });
