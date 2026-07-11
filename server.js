@@ -379,7 +379,11 @@ async function paceReplicate() {
 // viejo era tratar ese caso (HTTP 202 "starting") como un fallo: la imagen se estaba
 // generando bien, simplemente aún no estaba lista.
 async function generateImageReplicate(token, prompt, seed, jobId, idx) {
-  const MAX_ATTEMPTS = 3;
+  // 5 intentos, no 3: con 100 imagenes seguidas, 3 se quedaba corto y ~10 planos se
+  // perdian. Un plano perdido se rellena con el vecino, y eso se ve como una imagen
+  // repetida — justo lo que Edgar detecto y rechazo. Reintentar sale mucho mas barato
+  // (0,003 USD) que un plano duplicado en el video final.
+  const MAX_ATTEMPTS = 5;
   let lastErr;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -438,7 +442,13 @@ async function generateImageReplicate(token, prompt, seed, jobId, idx) {
     } catch (e) {
       lastErr = e;
       console.warn('[' + jobId + '] escena ' + idx + ' intento ' + attempt + '/' + MAX_ATTEMPTS + ' fallo: ' + e.message);
-      if (attempt < MAX_ATTEMPTS) await sleep(4000 * attempt);
+      if (attempt < MAX_ATTEMPTS) {
+        // Un 429 significa que Replicate esta saturado: esperar mas que ante un error
+        // normal. Los E9828 ("Director: unexpected error") son transitorios y suelen
+        // pasar al siguiente intento.
+        const es429 = /429/.test(e.message);
+        await sleep(es429 ? 15000 + 5000 * attempt : 4000 * attempt);
+      }
     }
   }
   throw lastErr;
