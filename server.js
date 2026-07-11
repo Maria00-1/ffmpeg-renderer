@@ -693,9 +693,37 @@ app.post('/render-v2', async (req, res) => {
       if (isLast) tail += ',fade=t=out:st=' + Math.max(dur - 0.8, 0) + ':d=0.8';
 
       if (sceneTypes[i] === 'video') {
-        const vf = 'scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=25' + tail;
+        // NUNCA repetir el clip en bucle para rellenar un plano mas largo que el.
+        // El clip animado dura ~5s; con planos de ~9s, el `-stream_loop -1` de antes
+        // reiniciaba el movimiento a mitad de plano y se veia como un bucle evidente
+        // (Edgar lo detecto en el primer video real). En su lugar se ESTIRA el tiempo:
+        // un 10-30% de ralentizacion es imperceptible, un bucle salta a la vista.
+        let clipDur = 0;
+        try {
+          clipDur = parseFloat(execSync(
+            'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + scenePaths[i] + '"'
+          ).toString().trim()) || 0;
+        } catch (e) { clipDur = 0; }
+
+        let pre = '';
+        let vf = 'scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080';
+
+        if (clipDur > 0.5 && dur > clipDur + 0.05) {
+          const factor = dur / clipDur;
+          if (factor <= 2.5) {
+            // Estirar el clip hasta cubrir el plano entero
+            vf = 'setpts=' + factor.toFixed(4) + '*PTS,' + vf;
+          } else {
+            // Plano desproporcionadamente largo para el clip: estirar al maximo
+            // razonable y congelar el ultimo fotograma el resto (mejor un cierre
+            // quieto que un bucle).
+            vf = 'setpts=2.5*PTS,' + vf + ',tpad=stop_mode=clone:stop_duration=' + (dur - clipDur * 2.5).toFixed(2);
+          }
+        }
+        vf += ',fps=25' + tail;
+
         await runFFmpeg(
-          '-stream_loop -1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          pre + '-i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
           '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
         );
       } else {
