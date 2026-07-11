@@ -347,6 +347,324 @@ app.post('/render', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// RENDER V2 — corte rápido al ritmo de la narración (canal "The Missing Page")
+//
+// Diferencias con /render (que NO se toca, Dark LATAM sigue usándolo):
+//  - Genera las imágenes aquí dentro (Replicate Flux Schnell) en vez de recibir URLs
+//    ya resueltas. Motivo: Flux tarda 26-40s por imagen y n8n no puede esperar a 65
+//    imágenes (el nodo Wait está roto en esa instancia y los Code node mueren a 60s).
+//    Aquí no hay ese límite: concurrencia real + polling + reintentos.
+//  - Corte seco entre planos en vez de fundido a negro por escena. Con planos de ~5s
+//    el fade in/out de /render provocaría un parpadeo negro constante.
+//  - Movimiento de cámara variado (6 patrones) en vez de zoom in/out alternado.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const REPLICATE_MODEL_URL = 'https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions';
+
+// Replicate tolera peticiones en serie sin 429 (medido), pero NO ráfagas. Este gate
+// global espacia la CREACIÓN de predicciones; una vez creadas corren en paralelo en
+// su infraestructura, así que la concurrencia real no la limita este valor.
+let nextReplicateStart = 0;
+const REPLICATE_PACING_MS = 1500;
+async function paceReplicate() {
+  const now = Date.now();
+  const waitMs = Math.max(nextReplicateStart - now, 0);
+  nextReplicateStart = Math.max(now, nextReplicateStart) + REPLICATE_PACING_MS;
+  if (waitMs > 0) await sleep(waitMs);
+}
+
+// Genera una imagen y devuelve su URL. Crea la predicción y, si no ha terminado
+// dentro de la ventana `Prefer: wait`, hace polling — el bug que rompía el pipeline
+// viejo era tratar ese caso (HTTP 202 "starting") como un fallo: la imagen se estaba
+// generando bien, simplemente aún no estaba lista.
+async function generateImageReplicate(token, prompt, seed, jobId, idx) {
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await paceReplicate();
+
+      const createRes = await fetch(REPLICATE_MODEL_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Content-Type': 'application/json',
+          'Prefer': 'wait=60'
+        },
+        body: JSON.stringify({
+          input: {
+            prompt: prompt,
+            aspect_ratio: '16:9',
+            num_outputs: 1,
+            output_format: 'jpg',
+            output_quality: 90,
+            seed: seed
+          }
+        })
+      });
+
+      if (createRes.status === 429) {
+        throw new Error('429 rate limit');
+      }
+      if (!createRes.ok && createRes.status !== 201 && createRes.status !== 202) {
+        const body = await createRes.text();
+        throw new Error('Replicate ' + createRes.status + ': ' + body.slice(0, 200));
+      }
+
+      let pred = await createRes.json();
+
+      // Polling: la predicción existe y está corriendo, solo hay que esperarla.
+      const POLL_DEADLINE = Date.now() + 180000;
+      while (pred.status !== 'succeeded' && pred.status !== 'failed' && pred.status !== 'canceled') {
+        if (Date.now() > POLL_DEADLINE) throw new Error('timeout esperando la prediccion');
+        await sleep(2500);
+        const pollRes = await fetch(pred.urls.get, {
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (!pollRes.ok) throw new Error('poll ' + pollRes.status);
+        pred = await pollRes.json();
+      }
+
+      if (pred.status !== 'succeeded') {
+        throw new Error('prediccion ' + pred.status + ': ' + (pred.error || 'sin detalle'));
+      }
+
+      const url = Array.isArray(pred.output) ? pred.output[0] : pred.output;
+      if (!url) throw new Error('prediccion sin output');
+      return url;
+
+    } catch (e) {
+      lastErr = e;
+      console.warn('[' + jobId + '] escena ' + idx + ' intento ' + attempt + '/' + MAX_ATTEMPTS + ' fallo: ' + e.message);
+      if (attempt < MAX_ATTEMPTS) await sleep(4000 * attempt);
+    }
+  }
+  throw lastErr;
+}
+
+// Movimiento de cámara variado. Con planos de ~5s, repetir siempre el mismo zoom
+// delata el automatismo; alternar 6 patrones es lo que da sensación de montaje.
+// La imagen entra escalada a 2400px de ancho para que el zoompan tenga margen real
+// de recorte y no interpole píxeles inventados.
+function kenBurnsVf(idx, dur) {
+  const frames = Math.max(Math.round(dur * 25), 2);
+  const d = frames;
+  const last = d - 1; // evita division por cero cuando d = 2
+  const variant = idx % 6;
+
+  // Con zoom fijo, el margen horizontal/vertical disponible para panear es
+  // (iw - iw/zoom) — recorrerlo de un extremo al otro produce el paneo.
+  const Z = '1.12';
+  const panX = "(iw-iw/zoom)*on/" + last;
+  const panXrev = "(iw-iw/zoom)*(1-on/" + last + ")";
+  const panY = "(ih-ih/zoom)*on/" + last;
+  const panYrev = "(ih-ih/zoom)*(1-on/" + last + ")";
+  const cx = "iw/2-(iw/zoom/2)";
+  const cy = "ih/2-(ih/zoom/2)";
+
+  let z, x, y;
+  switch (variant) {
+    case 0: z = "min(zoom+0.0012,1.18)"; x = cx;      y = cy;      break; // zoom in centro
+    case 1: z = "max(1.18-0.0012*on,1.0)"; x = cx;    y = cy;      break; // zoom out centro
+    case 2: z = Z;                        x = panX;   y = cy;      break; // paneo izq -> der
+    case 3: z = Z;                        x = panXrev; y = cy;     break; // paneo der -> izq
+    case 4: z = "min(zoom+0.0010,1.16)";  x = cx;     y = panYrev; break; // zoom in + sube
+    default: z = "max(1.16-0.0010*on,1.0)"; x = cx;   y = panY;    break; // zoom out + baja
+  }
+
+  return "scale=2400:-2,zoompan=z='" + z + "':d=" + d +
+         ":x='" + x + "':y='" + y + "':s=1920x1080:fps=25";
+}
+
+app.post('/render-v2', async (req, res) => {
+  const jobId = uuidv4();
+  const jobDir = path.join(WORK_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  try {
+    const body = req.body || {};
+    const width = body.width || 1920;
+    const height = body.height || 1080;
+    const scenes = body.scenes;
+    const token = process.env.REPLICATE_API_TOKEN || body.replicate_token;
+
+    if (!body.narration_url) return res.status(400).json({ error: 'Falta narration_url' });
+    if (!Array.isArray(scenes) || scenes.length === 0) return res.status(400).json({ error: 'Falta scenes[]' });
+
+    const needsGeneration = scenes.some(s => !s.source && s.prompt);
+    if (needsGeneration && !token) {
+      return res.status(400).json({ error: 'Falta REPLICATE_API_TOKEN (env del servicio) o replicate_token en el payload' });
+    }
+
+    console.log('[' + jobId + '] v2 — ' + scenes.length + ' escenas');
+
+    // 1. Narración
+    const narrationPath = path.join(jobDir, 'narration.mp3');
+    await downloadFileWithRetry(body.narration_url, narrationPath);
+    const mergedAudio = path.join(jobDir, 'audio_merged.mp3');
+    await runFFmpeg('-i "' + narrationPath + '" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mergedAudio + '"');
+
+    const totalDuration = parseFloat(execSync(
+      'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + mergedAudio + '"'
+    ).toString().trim());
+    console.log('[' + jobId + '] narracion: ' + totalDuration + 's');
+
+    // 2. Música de fondo (opcional) — mismo patrón defensivo que /render
+    let finalAudio = mergedAudio;
+    if (body.music_url) {
+      try {
+        const musicRaw = path.join(jobDir, 'music_raw.mp3');
+        await downloadFileWithRetry(body.music_url, musicRaw);
+        const musicLooped = path.join(jobDir, 'music_looped.mp3');
+        await runFFmpeg('-stream_loop -1 -i "' + musicRaw + '" -t ' + totalDuration + ' -c:a libmp3lame -ar 44100 -ac 2 "' + musicLooped + '"');
+        const vol = typeof body.music_volume === 'number' ? body.music_volume : 0.10;
+        const mixed = path.join(jobDir, 'audio_mixed.mp3');
+        await runFFmpeg(
+          '-i "' + mergedAudio + '" -i "' + musicLooped + '" ' +
+          '-filter_complex "[1:a]volume=' + vol + '[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=3[a]" ' +
+          '-map "[a]" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mixed + '"'
+        );
+        finalAudio = mixed;
+      } catch (e) {
+        console.warn('[' + jobId + '] musica falla, se continua sin ella: ' + e.message);
+      }
+    }
+
+    // 3. Resolver cada escena a un archivo local, en paralelo.
+    // Una escena puede venir ya con `source` (clip de Pexels, imagen previa) o solo
+    // con `prompt` (hay que generarla). Si una escena falla del todo NO se aborta el
+    // render: se marca como hueco y luego se rellena con la escena válida más cercana
+    // — perder un plano de 5s es aceptable, perder el vídeo entero no.
+    const scenePaths = new Array(scenes.length).fill(null);
+    const sceneTypes = new Array(scenes.length).fill('image');
+    const CONCURRENCY = 4;
+    let nextScene = 0;
+    let generated = 0;
+
+    async function sceneWorker() {
+      while (nextScene < scenes.length) {
+        const i = nextScene++;
+        const s = scenes[i];
+        try {
+          let url = s.source;
+          const isVideo = s.type === 'video';
+
+          if (!url) {
+            url = await generateImageReplicate(
+              token,
+              s.prompt,
+              typeof s.seed === 'number' ? s.seed : (1000 + i),
+              jobId,
+              i
+            );
+            generated++;
+            console.log('[' + jobId + '] escena ' + (i + 1) + '/' + scenes.length + ' generada (' + generated + ' ok)');
+          }
+
+          const ext = isVideo ? '.mp4' : '.jpg';
+          const dest = path.join(jobDir, 'scene_' + i + ext);
+          await downloadFileWithRetry(url, dest, 4);
+          scenePaths[i] = dest;
+          sceneTypes[i] = isVideo ? 'video' : 'image';
+        } catch (e) {
+          console.error('[' + jobId + '] escena ' + i + ' PERDIDA: ' + e.message);
+          scenePaths[i] = null;
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, scenes.length) }, sceneWorker));
+
+    // Rellenar huecos con la escena válida más cercana (atrás, luego adelante)
+    const okCount = scenePaths.filter(Boolean).length;
+    if (okCount === 0) throw new Error('Ninguna escena pudo resolverse');
+    for (let i = 0; i < scenePaths.length; i++) {
+      if (scenePaths[i]) continue;
+      let fill = null;
+      for (let b = i - 1; b >= 0 && !fill; b--) if (scenePaths[b]) fill = b;
+      for (let f = i + 1; f < scenePaths.length && !fill; f++) if (scenePaths[f]) fill = f;
+      scenePaths[i] = scenePaths[fill];
+      sceneTypes[i] = sceneTypes[fill];
+    }
+    console.log('[' + jobId + '] escenas resueltas: ' + okCount + '/' + scenes.length);
+
+    // 4. Reescalar duraciones para que la suma cuadre EXACTO con el audio real.
+    // n8n solo manda una estimación por palabras; la duración real solo se conoce
+    // aquí, tras el ffprobe.
+    const rawDurs = scenes.map(s => Math.max(parseFloat(s.dur) || 5, 1.5));
+    const rawSum = rawDurs.reduce((a, b) => a + b, 0);
+    const scale = totalDuration / rawSum;
+    const durs = rawDurs.map(d => d * scale);
+    durs[durs.length - 1] += (totalDuration - durs.reduce((a, b) => a + b, 0));
+
+    // 5. Renderizar cada plano. CORTE SECO: sin fundido a negro entre escenas.
+    // Solo fade-in al principio del vídeo y fade-out al final.
+    const clips = [];
+    for (let i = 0; i < scenes.length; i++) {
+      const dur = durs[i];
+      const clipPath = path.join(jobDir, 'clip_' + i + '.mp4');
+      const isFirst = i === 0;
+      const isLast = i === scenes.length - 1;
+
+      let tail = '';
+      if (isFirst) tail += ',fade=t=in:d=0.6';
+      if (isLast) tail += ',fade=t=out:st=' + Math.max(dur - 0.8, 0) + ':d=0.8';
+
+      if (sceneTypes[i] === 'video') {
+        const vf = 'scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=25' + tail;
+        await runFFmpeg(
+          '-stream_loop -1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      } else {
+        const vf = kenBurnsVf(i, dur) + tail;
+        await runFFmpeg(
+          '-loop 1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      }
+      clips.push(clipPath);
+    }
+
+    // 6. Concatenar (-c copy: los clips ya salen uniformes 1920x1080/25fps/h264)
+    const mergedVideo = path.join(jobDir, 'video_merged.mp4');
+    const listFile = path.join(jobDir, 'video_list.txt');
+    fs.writeFileSync(listFile, clips.map(p => "file '" + p + "'").join('\n'));
+    await runFFmpeg('-f concat -safe 0 -i "' + listFile + '" -c copy "' + mergedVideo + '"');
+
+    // 7. Vídeo + audio
+    const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
+    await runFFmpeg(
+      '-i "' + mergedVideo + '" -i "' + finalAudio + '" ' +
+      '-map 0:v:0 -map 1:a:0 -t ' + totalDuration + ' ' +
+      '-c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 192k -movflags +faststart ' +
+      '"' + outputFile + '"'
+    );
+
+    cleanup(jobDir);
+
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const videoUrl = protocol + '://' + req.headers.host + '/outputs/' + jobId + '.mp4';
+    console.log('[' + jobId + '] ✅ v2 completado: ' + videoUrl);
+
+    return res.json({
+      id: jobId,
+      status: 'succeeded',
+      url: videoUrl,
+      duracion_seg: totalDuration,
+      escenas_total: scenes.length,
+      escenas_ok: okCount,
+      escenas_rellenadas: scenes.length - okCount
+    });
+
+  } catch (err) {
+    cleanup(jobDir);
+    console.error('[' + jobId + '] ❌ v2 error:', err.message);
+    return res.status(500).json({ error: err.message, id: jobId });
+  }
+});
+
 // ─── Servir outputs ───────────────────────────────────────────────────────────
 app.use('/outputs', express.static(OUTPUT_DIR));
 
