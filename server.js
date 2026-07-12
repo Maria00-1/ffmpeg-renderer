@@ -491,7 +491,7 @@ async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId,
       await paceReplicate();
 
       const prompt = motionPrompt || 'subtle natural movement in the scene, gentle slow camera push in, soft shifting light';
-      const url = usarBarato ? PREDICTIONS_URL : WAN_MODEL_URL;
+      const endpointUrl = usarBarato ? PREDICTIONS_URL : WAN_MODEL_URL;
       const body = usarBarato
         ? {
             version: WAN_CHEAP_VERSION,
@@ -503,7 +503,7 @@ async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId,
             input: { image: imageUrl, prompt: prompt, num_frames: 81, frames_per_second: 16, resolution: resolution || '480p', seed: seed }
           };
 
-      const res = await fetch(url, {
+      const res = await fetch(endpointUrl, {
         method: 'POST',
         headers: {
           'Authorization': 'Bearer ' + token,
