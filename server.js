@@ -476,30 +476,41 @@ async function generateImageReplicate(token, prompt, seed, jobId, idx) {
 // Si falla, se devuelve null y el plano cae de vuelta a imagen + Ken Burns: animar
 // es una mejora, nunca un punto de fallo que tumbe el video.
 const WAN_MODEL_URL = 'https://api.replicate.com/v1/models/wan-video/wan-2.2-i2v-fast/predictions';
+// Alternativa destilada (Wan 2.1 + CausVid LoRA, 4 pasos): ~0,014 USD/clip medido, un
+// tercio del wan-2.2 (~0,046). Es lo que permite un video 100% animado por <2 USD.
+// Es un modelo de comunidad: se invoca por VERSION en /v1/predictions, no por nombre
+// (por nombre devuelve 404 — comprobado).
+const WAN_CHEAP_VERSION = 'e3e2b581dffc5a971ab8ef6322f53d93b83c277ec802a5d6bae0f3b62cf592bf';
+const PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 
-async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId, idx, resolution) {
+async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId, idx, resolution, model) {
+  const usarBarato = model === 'cheap';
   const MAX_ATTEMPTS = 2;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       await paceReplicate();
 
-      const res = await fetch(WAN_MODEL_URL, {
+      const prompt = motionPrompt || 'subtle natural movement in the scene, gentle slow camera push in, soft shifting light';
+      const url = usarBarato ? PREDICTIONS_URL : WAN_MODEL_URL;
+      const body = usarBarato
+        ? {
+            version: WAN_CHEAP_VERSION,
+            // 65 frames a 16fps = 4,06s de clip; con planos de max 4,6s el estiramiento
+            // queda en 1,13x como mucho, imperceptible.
+            input: { input_image: imageUrl, prompt: prompt, num_frames: 65, frames_per_second: 16, seed: seed }
+          }
+        : {
+            input: { image: imageUrl, prompt: prompt, num_frames: 81, frames_per_second: 16, resolution: resolution || '480p', seed: seed }
+          };
+
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Authorization': 'Bearer ' + token,
           'Content-Type': 'application/json',
           'Prefer': 'wait=60'
         },
-        body: JSON.stringify({
-          input: {
-            image: imageUrl,
-            prompt: motionPrompt || 'subtle natural movement in the scene, gentle slow camera push in, soft shifting light',
-            num_frames: 81,
-            frames_per_second: 16,
-            resolution: resolution || '480p',
-            seed: seed
-          }
-        })
+        body: JSON.stringify(body)
       });
 
       if (res.status === 429) throw new Error('429 rate limit');
@@ -628,6 +639,8 @@ app.post('/render-v2', async (req, res) => {
     const CONCURRENCY = 4;
     const animarGlobal = body.animate === true;
     const resolucionAnim = body.animate_resolution || '480p';
+    // 'cheap' = wan2.1-4step (~0,014 USD/clip) | cualquier otro valor = wan-2.2 (~0,046)
+    const modeloAnim = body.animate_model || 'fast';
     let nextScene = 0;
     let generated = 0;
     let animated = 0;
@@ -655,7 +668,7 @@ app.post('/render-v2', async (req, res) => {
             // dejar planos concretos como imagen fija (mas barato) sin tocar el resto.
             if (animarGlobal && s.animate !== false) {
               const vid = await animateImageReplicate(
-                token, url, s.motion, (typeof s.seed === 'number' ? s.seed : (1000 + i)), jobId, i, resolucionAnim
+                token, url, s.motion, (typeof s.seed === 'number' ? s.seed : (1000 + i)), jobId, i, resolucionAnim, modeloAnim
               );
               if (vid) {
                 url = vid;
