@@ -378,6 +378,34 @@ async function paceReplicate() {
 // dentro de la ventana `Prefer: wait`, hace polling — el bug que rompía el pipeline
 // viejo era tratar ese caso (HTTP 202 "starting") como un fallo: la imagen se estaba
 // generando bien, simplemente aún no estaba lista.
+// ─── Generar imagen GRATIS en Cloudflare Workers AI (flux-1-schnell) ─────────
+// Free tier: 10.000 neurons/dia ≈ 181 imagenes 1024x576 — cubre un video diario entero.
+// Devuelve un Buffer con el JPEG/PNG, o null si falla (el caller cae a Replicate).
+// Requiere CF_ACCOUNT_ID y CLOUDFLARE_API_TOKEN (token con permiso "Workers AI").
+async function generateImageCloudflare(prompt, seed, jobId, idx) {
+  const acc = process.env.CF_ACCOUNT_ID;
+  const tok = process.env.CLOUDFLARE_API_TOKEN;
+  if (!acc || !tok) return null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch('https://api.cloudflare.com/client/v4/accounts/' + acc + '/ai/run/@cf/black-forest-labs/flux-1-schnell', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: prompt.slice(0, 2048), steps: 4, width: 1024, height: 576, seed: seed })
+      });
+      if (!res.ok) throw new Error('CF ' + res.status);
+      const d = await res.json();
+      if (!d.success || !d.result || !d.result.image) throw new Error('CF sin imagen: ' + JSON.stringify(d.errors || {}).slice(0, 100));
+      return Buffer.from(d.result.image, 'base64');
+    } catch (e) {
+      console.warn('[' + jobId + '] CF escena ' + idx + ' intento ' + attempt + ': ' + e.message);
+      if (attempt < 2) await sleep(2000);
+    }
+  }
+  return null; // caller cae a Replicate
+}
+
 // Simplifica un prompt que Replicate rechaza. Hay prompts que fallan SIEMPRE con
 // `E9828 Director: unexpected error` (comprobado: el mismo prompt fallo 3 veces seguidas
 // mientras otro funcionaba a la primera), asi que reintentarlo identico no sirve de nada
@@ -647,8 +675,12 @@ app.post('/render-v2', async (req, res) => {
     const resolucionAnim = body.animate_resolution || '480p';
     // 'cheap' = wan2.1-4step (~0,014 USD/clip) | cualquier otro valor = wan-2.2 (~0,046)
     const modeloAnim = body.animate_model || 'fast';
+    // Base publica de este mismo servicio: las imagenes de Cloudflare se sirven desde
+    // /outputs para que el modelo de animacion (que exige URL) pueda descargarlas.
+    const publicBase = (req.headers['x-forwarded-proto'] || 'https') + '://' + req.headers.host;
     let nextScene = 0;
     let generated = 0;
+    let generatedCF = 0;
     let animated = 0;
     let animFallidas = 0;
 
@@ -661,13 +693,19 @@ app.post('/render-v2', async (req, res) => {
           let isVideo = s.type === 'video';
 
           if (!url) {
-            url = await generateImageReplicate(
-              token,
-              s.prompt,
-              typeof s.seed === 'number' ? s.seed : (1000 + i),
-              jobId,
-              i
-            );
+            const seedEscena = typeof s.seed === 'number' ? s.seed : (1000 + i);
+            // Primero Cloudflare (gratis, ~181 imagenes/dia); si falla o no esta
+            // configurado, Replicate (~0,003 USD). Mover las imagenes fuera de
+            // Replicate ademas le quita la mitad de la presion de rate limit.
+            const cfBuf = await generateImageCloudflare(s.prompt, seedEscena, jobId, i);
+            if (cfBuf) {
+              const tmpName = jobId + '_src_' + i + '.jpg';
+              fs.writeFileSync(path.join(OUTPUT_DIR, tmpName), cfBuf);
+              url = publicBase + '/outputs/' + tmpName;
+              generatedCF++;
+            } else {
+              url = await generateImageReplicate(token, s.prompt, seedEscena, jobId, i);
+            }
             generated++;
 
             // Animar el plano recien generado. `animate: false` en la escena permite
@@ -810,7 +848,8 @@ app.post('/render-v2', async (req, res) => {
       escenas_ok: okCount,
       escenas_rellenadas: scenes.length - okCount,
       escenas_animadas: animated,
-      animaciones_fallidas: animFallidas
+      animaciones_fallidas: animFallidas,
+      imagenes_cloudflare_gratis: generatedCF
     });
 
   } catch (err) {
