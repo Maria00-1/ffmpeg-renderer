@@ -485,7 +485,10 @@ const PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 
 async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId, idx, resolution, model) {
   const usarBarato = model === 'cheap';
-  const MAX_ATTEMPTS = 2;
+  // 3 intentos con espera larga ante 429: con saldo bajo Replicate recorta a rafaga de 1
+  // y con 2 intentos secos las animaciones caian a Ken Burns en silencio — el video salia
+  // sin el "todo animado" que es requisito. Un intento extra cuesta centimos.
+  const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       await paceReplicate();
@@ -535,7 +538,10 @@ async function animateImageReplicate(token, imageUrl, motionPrompt, seed, jobId,
 
     } catch (e) {
       console.warn('[' + jobId + '] animar escena ' + idx + ' intento ' + attempt + ': ' + e.message);
-      if (attempt < MAX_ATTEMPTS) await sleep(5000 * attempt);
+      if (attempt < MAX_ATTEMPTS) {
+        const es429 = /429/.test(e.message);
+        await sleep(es429 ? 15000 + 5000 * attempt : 5000 * attempt);
+      }
     }
   }
   return null; // degrada a imagen fija + Ken Burns
