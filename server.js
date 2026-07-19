@@ -1228,6 +1228,94 @@ app.post('/render-short', async (req, res) => {
   }
 });
 
+// ─── Recortar Shorts desde un video YA renderizado (sin generar nada nuevo) ──
+// A diferencia de /render-short (genera imagenes/animacion desde cero por
+// fragmento, ~0,50 $ por short), esto solo recorta y reencuadra un tramo del
+// video largo que YA se pago y ya esta terminado. Coste real: 0 $, solo ffmpeg
+// local sobre un archivo que ya existe.
+app.post('/short-from-video', async (req, res) => {
+  const jobId = uuidv4();
+  const jobDir = path.join(WORK_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  try {
+    const body = req.body || {};
+    const videoUrl = body.video_url;
+    const cortes = body.cortes;
+    const jobKey = body.job_key || jobId;
+
+    if (!videoUrl) return res.status(400).json({ error: 'Falta video_url' });
+    if (!Array.isArray(cortes) || cortes.length === 0) return res.status(400).json({ error: 'Falta cortes[]' });
+    if (cortes.length > 6) return res.status(400).json({ error: 'Maximo 6 cortes por llamada' });
+
+    console.log('[' + jobId + '] short-from-video (' + jobKey + ') — ' + cortes.length + ' cortes');
+
+    // 1. Descargar el video largo UNA sola vez -- se reutiliza para todos los cortes
+    const sourcePath = path.join(jobDir, 'source.mp4');
+    await downloadFileWithRetry(videoUrl, sourcePath, 4);
+    const sourceDuration = parseFloat(execSync(
+      'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + sourcePath + '"'
+    ).toString().trim());
+    if (!sourceDuration || sourceDuration <= 0) throw new Error('No se pudo leer la duracion del video de origen');
+
+    // 2. Recortar cada tramo: vertical 1080x1920, corte seco, etiqueta opcional
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const shorts = [];
+    for (let i = 0; i < cortes.length; i++) {
+      const c = cortes[i] || {};
+      const inicio = Math.max(0, Math.min(parseFloat(c.inicio) || 0, sourceDuration - 1));
+      let fin = Math.max(inicio + 1, Math.min(parseFloat(c.fin) || sourceDuration, sourceDuration));
+      // Tope 62s: un short mas largo no es un fallo, solo se recorta el sobrante
+      // en vez de rechazar el corte entero.
+      if (fin - inicio > 62) fin = inicio + 62;
+      const dur = fin - inicio;
+
+      let vf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=25' +
+        ',fade=t=in:d=0.4,fade=t=out:st=' + Math.max(dur - 0.5, 0).toFixed(2) + ':d=0.5';
+      if (c.etiqueta) {
+        const cap = prepararCaptionShort(c.etiqueta);
+        vf += ",drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='" + cap +
+          "':fontcolor=white:fontsize=52:line_spacing=8:box=1:boxcolor=black@0.55:boxborderw=18:" +
+          "x=(w-text_w)/2:y=h*0.10";
+      }
+
+      const clipName = jobId + '_short_' + i + '.mp4';
+      const clipPath = path.join(OUTPUT_DIR, clipName);
+      await runFFmpeg(
+        '-ss ' + inicio.toFixed(2) + ' -i "' + sourcePath + '" -t ' + dur.toFixed(2) +
+        ' -vf "' + vf + '" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 192k ' +
+        '-movflags +faststart "' + clipPath + '"'
+      );
+
+      shorts.push({
+        idx: i,
+        etiqueta: c.etiqueta || null,
+        inicio_seg: Math.round(inicio * 10) / 10,
+        fin_seg: Math.round(fin * 10) / 10,
+        duracion_seg: Math.round(dur * 10) / 10,
+        url: protocol + '://' + req.headers.host + '/outputs/' + clipName
+      });
+    }
+
+    cleanup(jobDir);
+    console.log('[' + jobId + '] ✅ ' + shorts.length + ' shorts recortados del video ya renderizado (coste 0 $)');
+    return res.json({
+      id: jobId,
+      status: 'succeeded',
+      job_key: jobKey,
+      source_duration_seg: sourceDuration,
+      total: shorts.length,
+      shorts,
+      coste_estimado_usd: 0
+    });
+
+  } catch (err) {
+    cleanup(jobDir);
+    console.error('[' + jobId + '] ❌ short-from-video error:', err.message);
+    return res.status(500).json({ error: err.message, id: jobId });
+  }
+});
+
 // ─── Servir outputs ───────────────────────────────────────────────────────────
 app.use('/outputs', express.static(OUTPUT_DIR));
 
@@ -1240,6 +1328,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     outputs: fs.readdirSync(OUTPUT_DIR).length,
     render_v2: true,
+    short_from_video: true,
     // EasyPanel no redespliega solo tras un push y no habia forma de saber que version
     // corria de verdad. Con el commit expuesto aqui, verificar un deploy es una peticion.
     git_sha: (process.env.GIT_SHA || 'desconocido').slice(0, 7),
