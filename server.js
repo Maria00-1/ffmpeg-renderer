@@ -5,14 +5,16 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const WORK_DIR = '/tmp/renders';
 const OUTPUT_DIR = '/app/outputs';
+const CACHE_DIR = '/tmp/render_cache';   // persiste entre requests; cleanup() NO lo toca
 
-[WORK_DIR, OUTPUT_DIR].forEach(d => {
+[WORK_DIR, OUTPUT_DIR, CACHE_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
@@ -139,6 +141,57 @@ function cleanup(dir) {
   } catch (e) {
     console.error('Cleanup error:', e.message);
   }
+}
+
+// ─── Caché de assets por job_key ──────────────────────────────────────────────
+// Reutiliza la imagen/animación ya generada (y pagada en Replicate) cuando se
+// relanza el MISMO guion tras un fallo/timeout, en vez de re-pagarla desde cero.
+// Es aditiva: si algo falla en el lookup se cae a generar como siempre, nunca
+// rompe un render.
+const CACHE_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // 7 días — evita que la caché llene el disco
+
+function pruneCache() {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(CACHE_DIR)) {
+      const fp = path.join(CACHE_DIR, f);
+      try {
+        if (now - fs.statSync(fp).mtimeMs > CACHE_MAX_AGE_MS) fs.rmSync(fp, { force: true });
+      } catch (e) {}
+    }
+  } catch (e) { console.warn('[cache] prune: ' + e.message); }
+}
+
+// Hash del CONTENIDO que determina el asset. Si cambia el guion (prompt/motion/
+// seed/modelo/animado-o-no), cambia la clave y se regenera — nunca se sirve un
+// asset viejo por error.
+function cacheKeyFor(jobKey, i, s, animarGlobal, modeloAnim, resolucionAnim) {
+  const material = [
+    jobKey, i, s.source || '', s.prompt || '', s.motion || '',
+    (typeof s.seed === 'number' ? s.seed : (1000 + i)),
+    (animarGlobal && s.animate !== false) ? 'anim' : 'fija',
+    modeloAnim, resolucionAnim
+  ].join('|');
+  return crypto.createHash('sha1').update(material).digest('hex');
+}
+
+// Ruta del asset cacheado (.mp4 animación / .jpg imagen) si existe, o null.
+function cacheHit(key) {
+  for (const ext of ['.mp4', '.jpg']) {
+    const fp = path.join(CACHE_DIR, key + ext);
+    if (fs.existsSync(fp)) return fp;
+  }
+  return null;
+}
+
+// Guardado atómico (los 4 workers escriben en paralelo): temp + rename.
+function cacheStore(key, srcPath, ext) {
+  try {
+    const dst = path.join(CACHE_DIR, key + ext);
+    const tmp = dst + '.' + process.pid + '.' + Math.random().toString(36).slice(2) + '.tmp';
+    fs.copyFileSync(srcPath, tmp);
+    fs.renameSync(tmp, dst);
+  } catch (e) { console.warn('[cache] store: ' + e.message); }
 }
 
 // ─── POST /render ─────────────────────────────────────────────────────────────
@@ -629,7 +682,9 @@ app.post('/render-v2', async (req, res) => {
       return res.status(400).json({ error: 'Falta REPLICATE_API_TOKEN (env del servicio) o replicate_token en el payload' });
     }
 
-    console.log('[' + jobId + '] v2 — ' + scenes.length + ' escenas');
+    const jobKey = body.job_key || jobId;   // sin job_key -> jobId aleatorio -> la caché siempre falla (= comportamiento de hoy)
+    pruneCache();
+    console.log('[' + jobId + '] v2 (job_key=' + jobKey + ') — ' + scenes.length + ' escenas');
 
     // 1. Narración
     const narrationPath = path.join(jobDir, 'narration.mp3');
@@ -683,12 +738,28 @@ app.post('/render-v2', async (req, res) => {
     let generatedCF = 0;
     let animated = 0;
     let animFallidas = 0;
+    let reused = 0;
 
     async function sceneWorker() {
       while (nextScene < scenes.length) {
         const i = nextScene++;
         const s = scenes[i];
         try {
+          // Caché: si este plano (mismo contenido, mismo job_key) ya se generó y
+          // pagó en un intento anterior, reutilizarlo — 0 llamadas de pago.
+          const ckey = cacheKeyFor(jobKey, i, s, animarGlobal, modeloAnim, resolucionAnim);
+          const hit = cacheHit(ckey);
+          if (hit) {
+            const hitExt = path.extname(hit);
+            const dest = path.join(jobDir, 'scene_' + i + hitExt);
+            fs.copyFileSync(hit, dest);
+            scenePaths[i] = dest;
+            sceneTypes[i] = hitExt === '.mp4' ? 'video' : 'image';
+            reused++;
+            console.log('[' + jobId + '] escena ' + (i + 1) + '/' + scenes.length + ' REUSADA de cache');
+            continue;
+          }
+
           let url = s.source;
           let isVideo = s.type === 'video';
 
@@ -731,6 +802,7 @@ app.post('/render-v2', async (req, res) => {
           await downloadFileWithRetry(url, dest, 4);
           scenePaths[i] = dest;
           sceneTypes[i] = isVideo ? 'video' : 'image';
+          cacheStore(ckey, dest, ext);   // guardar el asset final para reusarlo en un relanzo del mismo guion
         } catch (e) {
           console.error('[' + jobId + '] escena ' + i + ' PERDIDA: ' + e.message);
           scenePaths[i] = null;
@@ -848,6 +920,7 @@ app.post('/render-v2', async (req, res) => {
       escenas_ok: okCount,
       escenas_rellenadas: scenes.length - okCount,
       escenas_animadas: animated,
+      escenas_reusadas: reused,
       animaciones_fallidas: animFallidas,
       imagenes_cloudflare_gratis: generatedCF
     });
