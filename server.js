@@ -1389,6 +1389,186 @@ app.post('/short-from-video', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// RENDER REEL — reels verticales desde material real + IA (Red7Vidas)
+//
+// A diferencia de /render-short (genera CADA escena desde un prompt via Replicate/
+// Cloudflare), aqui las escenas ya vienen resueltas: n8n manda la URL real de cada
+// foto/clip (material subido a Drive, o video/foto de stock de Pexels) -- este
+// endpoint NO llama a Replicate ni Cloudflare, solo descarga lo que le mandan.
+// Reusa kenBurnsVfShort() y prepararCaptionShort() (genericas, no dependen de la
+// logica de generacion) y el patron de mezcla de musica de /render-v2. Mismo
+// principio que el resto del archivo: clon independiente, no toca ningun otro
+// endpoint.
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/render-reel', async (req, res) => {
+  const jobId = uuidv4();
+  const jobDir = path.join(WORK_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  try {
+    const body = req.body || {};
+    const scenes = body.scenes;
+    const jobKey = body.job_key || jobId;
+
+    if (!body.narration_url) return res.status(400).json({ error: 'Falta narration_url' });
+    if (!Array.isArray(scenes) || scenes.length === 0) return res.status(400).json({ error: 'Falta scenes[]' });
+    for (let i = 0; i < scenes.length; i++) {
+      if (!scenes[i] || !scenes[i].source) return res.status(400).json({ error: 'Escena ' + i + ' sin source (URL de foto/video ya resuelta)' });
+    }
+
+    console.log('[' + jobId + '] reel (job_key=' + jobKey + ') — ' + scenes.length + ' escenas');
+
+    // 1. Narracion
+    const narrationPath = path.join(jobDir, 'narration.mp3');
+    await downloadFileWithRetry(body.narration_url, narrationPath);
+    const mergedAudio = path.join(jobDir, 'audio_merged.mp3');
+    await runFFmpeg('-i "' + narrationPath + '" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mergedAudio + '"');
+    const totalDuration = parseFloat(execSync(
+      'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + mergedAudio + '"'
+    ).toString().trim());
+    console.log('[' + jobId + '] reel narracion: ' + totalDuration + 's');
+
+    // 2. Musica de fondo (opcional) -- mismo patron defensivo que /render-v2
+    let finalAudio = mergedAudio;
+    if (body.music_url) {
+      try {
+        const musicRaw = path.join(jobDir, 'music_raw.mp3');
+        await downloadFileWithRetry(body.music_url, musicRaw);
+        const musicLooped = path.join(jobDir, 'music_looped.mp3');
+        await runFFmpeg('-stream_loop -1 -i "' + musicRaw + '" -t ' + totalDuration + ' -c:a libmp3lame -ar 44100 -ac 2 "' + musicLooped + '"');
+        const vol = typeof body.music_volume === 'number' ? body.music_volume : 0.12;
+        const mixed = path.join(jobDir, 'audio_mixed.mp3');
+        await runFFmpeg(
+          '-i "' + mergedAudio + '" -i "' + musicLooped + '" ' +
+          '-filter_complex "[1:a]volume=' + vol + '[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=3[a]" ' +
+          '-map "[a]" -c:a libmp3lame -ar 44100 -ac 2 -b:a 192k "' + mixed + '"'
+        );
+        finalAudio = mixed;
+      } catch (e) {
+        console.warn('[' + jobId + '] reel musica falla, se continua sin ella: ' + e.message);
+      }
+    }
+
+    // 3. Descargar cada escena (ya resuelta por n8n -- sin generacion aqui)
+    const scenePaths = new Array(scenes.length);
+    const DOWNLOAD_CONCURRENCY = 3;
+    let nextDl = 0;
+    async function downloadWorker() {
+      while (nextDl < scenes.length) {
+        const i = nextDl++;
+        const isVideo = scenes[i].type === 'video';
+        const dest = path.join(jobDir, 'scene_' + i + (isVideo ? '.mp4' : '.jpg'));
+        await downloadFileWithRetry(scenes[i].source, dest, 4);
+        scenePaths[i] = dest;
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, scenes.length) }, downloadWorker));
+
+    // 4. Reescalar duraciones para cuadrar EXACTO con el audio real (n8n solo manda
+    // una estimacion)
+    const rawDurs = scenes.map(s => Math.max(parseFloat(s.dur) || 3, 1.2));
+    const rawSum = rawDurs.reduce((a, b) => a + b, 0);
+    const scale = totalDuration / rawSum;
+    const durs = rawDurs.map(d => d * scale);
+    durs[durs.length - 1] += (totalDuration - durs.reduce((a, b) => a + b, 0));
+
+    // 5. Renderizar cada plano: vertical 1080x1920, corte seco, subtitulo por escena
+    // (s.texto, reusa prepararCaptionShort) + gancho opcional (hook_overlay) SOLO en
+    // el primer plano y solo en sus primeros ~2.6s.
+    const clips = [];
+    for (let i = 0; i < scenes.length; i++) {
+      const s = scenes[i];
+      const dur = durs[i];
+      const clipPath = path.join(jobDir, 'clip_' + i + '.mp4');
+      const isFirst = i === 0, isLast = i === scenes.length - 1;
+
+      let tail = '';
+      if (isFirst) tail += ',fade=t=in:d=0.5';
+      if (isLast) tail += ',fade=t=out:st=' + Math.max(dur - 0.6, 0) + ':d=0.6';
+      if (s.texto) {
+        const cap = prepararCaptionShort(s.texto);
+        tail += ",drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='" + cap +
+          "':fontcolor=white:fontsize=46:line_spacing=8:box=1:boxcolor=black@0.55:boxborderw=18:" +
+          "x=(w-text_w)/2:y=h-h*0.22";
+      }
+      if (isFirst && body.hook_overlay) {
+        const hook = prepararCaptionShort(body.hook_overlay);
+        tail += ",drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='" + hook +
+          "':fontcolor=0xffd400:fontsize=58:line_spacing=8:box=1:boxcolor=black@0.6:boxborderw=20:" +
+          "x=(w-text_w)/2:y=h*0.08:enable='lte(t,2.6)'";
+      }
+
+      if (s.type === 'video') {
+        let clipDur = 0;
+        try {
+          clipDur = parseFloat(execSync(
+            'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + scenePaths[i] + '"'
+          ).toString().trim()) || 0;
+        } catch (e) { clipDur = 0; }
+
+        let vf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920';
+        if (clipDur > 0.5 && dur > clipDur + 0.05) {
+          const factor = dur / clipDur;
+          if (factor <= 2.5) {
+            vf = 'setpts=' + factor.toFixed(4) + '*PTS,' + vf;
+          } else {
+            vf = 'setpts=2.5*PTS,' + vf + ',tpad=stop_mode=clone:stop_duration=' + (dur - clipDur * 2.5).toFixed(2);
+          }
+        }
+        vf += ',fps=25' + tail;
+        await runFFmpeg(
+          '-i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      } else {
+        const vf = kenBurnsVfShort(i, dur) + tail;
+        await runFFmpeg(
+          '-loop 1 -i "' + scenePaths[i] + '" -t ' + dur + ' -vf "' + vf + '" ' +
+          '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + clipPath + '"'
+        );
+      }
+      clips.push(clipPath);
+    }
+
+    // 6. Concatenar + audio (narracion + musica ya mezcladas)
+    const mergedVideo = path.join(jobDir, 'video_merged.mp4');
+    const listFile = path.join(jobDir, 'video_list.txt');
+    fs.writeFileSync(listFile, clips.map(p => "file '" + p + "'").join('\n'));
+    await runFFmpeg('-f concat -safe 0 -i "' + listFile + '" -c copy "' + mergedVideo + '"');
+
+    const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
+    await runFFmpeg(
+      '-i "' + mergedVideo + '" -i "' + finalAudio + '" ' +
+      '-map 0:v:0 -map 1:a:0 -t ' + totalDuration + ' ' +
+      '-c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 192k -movflags +faststart ' +
+      '"' + outputFile + '"'
+    );
+
+    cleanup(jobDir);
+
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const videoUrl = protocol + '://' + req.headers.host + '/outputs/' + jobId + '.mp4';
+    console.log('[' + jobId + '] ✅ reel completado: ' + videoUrl);
+
+    return res.json({
+      id: jobId,
+      status: 'succeeded',
+      job_key: jobKey,
+      url: videoUrl,
+      duracion_seg: totalDuration,
+      escenas_total: scenes.length,
+      coste_estimado_usd: 0
+    });
+
+  } catch (err) {
+    cleanup(jobDir);
+    console.error('[' + jobId + '] ❌ reel error:', err.message);
+    return res.status(500).json({ error: err.message, id: jobId });
+  }
+});
+
 // ─── Servir outputs ───────────────────────────────────────────────────────────
 app.use('/outputs', express.static(OUTPUT_DIR));
 
@@ -1402,6 +1582,7 @@ app.get('/health', (req, res) => {
     outputs: fs.readdirSync(OUTPUT_DIR).length,
     render_v2: true,
     short_from_video: true,
+    render_reel: true,
     // EasyPanel no redespliega solo tras un push y no habia forma de saber que version
     // corria de verdad. Con el commit expuesto aqui, verificar un deploy es una peticion.
     git_sha: (process.env.GIT_SHA || 'desconocido').slice(0, 7),
