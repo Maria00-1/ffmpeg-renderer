@@ -6,6 +6,29 @@ const https = require('https');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const heicConvert = require('heic-convert');
+
+// ─── Helper: convertir HEIC/HEIF a JPEG in-place si hace falta ────────────────
+// Las fotos de iPhone llegan en HEIC por defecto (Google Drive las sirve tal cual,
+// sin convertir) y el ffmpeg de este contenedor no tiene libheif -- "Error opening
+// input file" en vez de un error claro. Se detecta por el brand ISO-BMFF (offset 8,
+// no por extension) y se sobrescribe el mismo path con el JPEG resultante.
+async function convertHeicIfNeeded(filePath) {
+  try {
+    const buf = fs.readFileSync(filePath);
+    if (buf.length > 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
+      const brand = buf.toString('ascii', 8, 12);
+      if (/^(heic|heix|hevc|heim|heis|hevm|hevs|mif1|msf1)$/i.test(brand)) {
+        const jpegBuffer = await heicConvert({ buffer: buf, format: 'JPEG', quality: 0.9 });
+        fs.writeFileSync(filePath, Buffer.from(jpegBuffer));
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn('[heic-convert] fallo convirtiendo ' + filePath + ': ' + e.message);
+  }
+  return false;
+}
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -1461,6 +1484,7 @@ app.post('/render-reel', async (req, res) => {
         const isVideo = scenes[i].type === 'video';
         const dest = path.join(jobDir, 'scene_' + i + (isVideo ? '.mp4' : '.jpg'));
         await downloadFileWithRetry(scenes[i].source, dest, 4);
+        if (!isVideo) await convertHeicIfNeeded(dest);
         scenePaths[i] = dest;
       }
     }
