@@ -1568,7 +1568,15 @@ app.post('/render-reel', async (req, res) => {
       await downloadFileWithRetry(body.outro.source, outroSrc, 4);
       if (!outroIsVideo) await convertHeicIfNeeded(outroSrc);
       const outroClip = path.join(jobDir, 'clip_outro.mp4');
-      const outroVf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,' +
+      // "tal cual": encajar completo (nunca recortar) sobre fondo blanco, no
+      // rellenar-y-recortar como las escenas normales -- una imagen de marca
+      // casi cuadrada recortada a 1080x1920 salia muy ampliada y cortada.
+      // Debajo, dentro del margen que deja el letterbox, un aviso fijo de
+      // WhatsApp con el numero, mismo tiempo en pantalla que la imagen.
+      const outroVf = 'scale=1080:1920:force_original_aspect_ratio=decrease,' +
+        'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=white,' +
+        "drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='☎  614 880 597':" +
+        "fontcolor=white:fontsize=50:box=1:boxcolor=0x25D366:boxborderw=22:x=(w-text_w)/2:y=h-280," +
         'fade=t=in:d=0.4,fade=t=out:st=' + Math.max(outroDur - 0.6, 0) + ':d=0.6';
       if (outroIsVideo) {
         await runFFmpeg(
