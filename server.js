@@ -1556,16 +1556,49 @@ app.post('/render-reel', async (req, res) => {
       clips.push(clipPath);
     }
 
+    // 5b. Foto/video de cierre fijo (opcional, body.outro). NO participa en el
+    // prorrateo del paso 4 -- se renderiza aparte y se concatena al final, por
+    // eso el video final puede durar mas que la narracion: ese tramo extra
+    // sale sin pista de audio propia, en silencio, sin generar nada artificial.
+    let outroDur = 0;
+    if (body.outro && body.outro.source) {
+      outroDur = Math.max(parseFloat(body.outro.dur) || 2.5, 1);
+      const outroIsVideo = body.outro.type === 'video';
+      const outroSrc = path.join(jobDir, 'outro' + (outroIsVideo ? '.mp4' : '.jpg'));
+      await downloadFileWithRetry(body.outro.source, outroSrc, 4);
+      if (!outroIsVideo) await convertHeicIfNeeded(outroSrc);
+      const outroClip = path.join(jobDir, 'clip_outro.mp4');
+      const outroVf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,' +
+        'fade=t=in:d=0.4,fade=t=out:st=' + Math.max(outroDur - 0.6, 0) + ':d=0.6';
+      if (outroIsVideo) {
+        await runFFmpeg(
+          '-i "' + outroSrc + '" -t ' + outroDur + ' -vf "' + outroVf + ',fps=25" ' +
+          '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + outroClip + '"'
+        );
+      } else {
+        await runFFmpeg(
+          '-loop 1 -i "' + outroSrc + '" -t ' + outroDur + ' -vf "' + outroVf + '" ' +
+          '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + outroClip + '"'
+        );
+      }
+      clips.push(outroClip);
+      console.log('[' + jobId + '] reel outro anadido: ' + outroDur + 's');
+    }
+
     // 6. Concatenar + audio (narracion + musica ya mezcladas)
     const mergedVideo = path.join(jobDir, 'video_merged.mp4');
     const listFile = path.join(jobDir, 'video_list.txt');
     fs.writeFileSync(listFile, clips.map(p => "file '" + p + "'").join('\n'));
     await runFFmpeg('-f concat -safe 0 -i "' + listFile + '" -c copy "' + mergedVideo + '"');
 
+    // finalDuration = narracion + outro (si lo hay). El outro no tiene pista de
+    // audio propia, asi que ese tramo se entrega en silencio, no con silencio
+    // generado a proposito -- simplemente no hay mas audio que mapear.
+    const finalDuration = totalDuration + outroDur;
     const outputFile = path.join(OUTPUT_DIR, jobId + '.mp4');
     await runFFmpeg(
       '-i "' + mergedVideo + '" -i "' + finalAudio + '" ' +
-      '-map 0:v:0 -map 1:a:0 -t ' + totalDuration + ' ' +
+      '-map 0:v:0 -map 1:a:0 -t ' + finalDuration + ' ' +
       '-c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 192k -movflags +faststart ' +
       '"' + outputFile + '"'
     );
@@ -1581,8 +1614,8 @@ app.post('/render-reel', async (req, res) => {
       status: 'succeeded',
       job_key: jobKey,
       url: videoUrl,
-      duracion_seg: totalDuration,
-      escenas_total: scenes.length,
+      duracion_seg: finalDuration,
+      escenas_total: scenes.length + (outroDur > 0 ? 1 : 0),
       coste_estimado_usd: 0
     });
 
@@ -1607,6 +1640,7 @@ app.get('/health', (req, res) => {
     render_v2: true,
     short_from_video: true,
     render_reel: true,
+    render_reel_outro: true,
     // EasyPanel no redespliega solo tras un push y no habia forma de saber que version
     // corria de verdad. Con el commit expuesto aqui, verificar un deploy es una peticion.
     git_sha: (process.env.GIT_SHA || 'desconocido').slice(0, 7),
