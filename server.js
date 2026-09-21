@@ -1573,20 +1573,38 @@ app.post('/render-reel', async (req, res) => {
       // casi cuadrada recortada a 1080x1920 salia muy ampliada y cortada.
       // Debajo, dentro del margen que deja el letterbox, un aviso fijo de
       // WhatsApp con el numero, mismo tiempo en pantalla que la imagen.
-      const outroVf = 'scale=1080:1920:force_original_aspect_ratio=decrease,' +
-        'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=white,' +
-        "drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='☎  614 880 597':" +
-        "fontcolor=white:fontsize=50:box=1:boxcolor=0x25D366:boxborderw=22:x=(w-text_w)/2:y=h-280," +
-        'fade=t=in:d=0.4,fade=t=out:st=' + Math.max(outroDur - 0.6, 0) + ':d=0.6';
-      if (outroIsVideo) {
+      // Badge inferior del cierre. Si el payload trae outro.badge (URL de un PNG con
+      // transparencia, ya compuesto: icono real de WhatsApp + el numero), se superpone
+      // esa imagen centrada, con su base a 300px del borde inferior. Si no viene, se
+      // mantiene el aviso de texto de siempre, asi un despliegue sin el cambio de n8n
+      // (o al reves) no rompe nada. El glifo de telefono del texto NO es el logo de
+      // WhatsApp: por eso ahora se superpone una imagen (21/09/2026).
+      // Cambiar el badge = subir otro PNG a Drive y cambiar el id en n8n. Sin tocar esto.
+      let badgeSrc = null;
+      if (body.outro.badge) {
+        badgeSrc = path.join(jobDir, 'outro_badge.png');
+        await downloadFileWithRetry(body.outro.badge, badgeSrc, 4);
+      }
+      const outroBase = 'scale=1080:1920:force_original_aspect_ratio=decrease,' +
+        'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=white' +
+        (badgeSrc ? '' :
+          ",drawtext=fontfile=/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf:text='☎  614 880 597':" +
+          'fontcolor=white:fontsize=50:box=1:boxcolor=0x25D366:boxborderw=22:x=(w-text_w)/2:y=h-280') +
+        (outroIsVideo ? ',fps=25' : '');
+      const outroFade = 'fade=t=in:d=0.4,fade=t=out:st=' + Math.max(outroDur - 0.6, 0) + ':d=0.6';
+      const outroIn = (outroIsVideo ? '' : '-loop 1 ') + '-i "' + outroSrc + '"';
+      if (badgeSrc) {
         await runFFmpeg(
-          '-i "' + outroSrc + '" -t ' + outroDur + ' -vf "' + outroVf + ',fps=25" ' +
+          outroIn + ' -i "' + badgeSrc + '" -t ' + outroDur +
+          ' -filter_complex "[0:v]' + outroBase + '[base];' +
+          '[base][1:v]overlay=(W-w)/2:H-300[conbadge];' +
+          '[conbadge]' + outroFade + '[v]" -map "[v]" ' +
           '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + outroClip + '"'
         );
       } else {
         await runFFmpeg(
-          '-loop 1 -i "' + outroSrc + '" -t ' + outroDur + ' -vf "' + outroVf + '" ' +
-          '-c:v libx264 -preset veryfast -pix_fmt yuv420p "' + outroClip + '"'
+          outroIn + ' -t ' + outroDur + ' -vf "' + outroBase + ',' + outroFade + '" ' +
+          '-an -c:v libx264 -preset veryfast -pix_fmt yuv420p "' + outroClip + '"'
         );
       }
       clips.push(outroClip);
@@ -1649,6 +1667,7 @@ app.get('/health', (req, res) => {
     short_from_video: true,
     render_reel: true,
     render_reel_outro: true,
+    render_reel_badge: true,
     // EasyPanel no redespliega solo tras un push y no habia forma de saber que version
     // corria de verdad. Con el commit expuesto aqui, verificar un deploy es una peticion.
     git_sha: (process.env.GIT_SHA || 'desconocido').slice(0, 7),
